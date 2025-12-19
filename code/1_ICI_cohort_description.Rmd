@@ -1,0 +1,1247 @@
+---
+title: "loading data"
+author: "Ruben Mars"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+params:
+  clin_meta: "../data/Supplementary Table 1.xlsx" 
+
+
+output: 
+  html_document:
+    toc: true
+    theme: cerulean
+    
+---
+
+<style type="text/css">
+.main-container {
+  max-width: 1200px;
+  margin-left: auto;
+  margin-right: auto;
+}
+</style>
+
+***  
+
+
+
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+require(tidyverse)
+require(readxl)
+require(ggplot2)
+require(RColorBrewer)
+require(vegan)
+require(ape)
+require(tidyverse)
+require(ggpubr)
+require(cowplot)
+require(randomForest)
+require(ROCR)
+require(gtsummary)
+require(flextable)
+require(gridExtra)
+library(ggpubr)
+require(reshape2)
+require(dplyr)
+require(openxlsx)
+require(knitr)
+#library(devtools)
+#install_github("jokergoo/ComplexHeatmap")
+require(ComplexHeatmap)
+require(circlize)
+require(mlbench)
+require(caret)
+require(ropls)
+require(GUniFrac)
+require(microViz)
+require(phyloseq)
+require(gt)
+require(cardx)
+require(ComplexUpset)
+
+
+```
+
+
+Load clinical data and put in same format as the sequencing files
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+clin_meta <- as.data.frame(read.xlsx(params$clin_meta, rowNames = T, sheet = 1))
+colnames(clin_meta)
+
+clin_meta$Age <- as.numeric(clin_meta$Age)
+clin_meta$BMI <- as.numeric(clin_meta$BMI)
+clin_meta$Elixhauser_elix.sum <- as.numeric(clin_meta$Elixhauser_elix.sum)
+
+
+```
+
+
+Inspect additional grouping of side effects and outcomes combined
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+table(clin_meta$IRB)
+#15-000934 19-003060 
+#       14       163 
+
+table(clin_meta$any_toxicity)
+# 0   1 
+# 80 97
+
+table(clin_meta$IMDC, clin_meta$hepatitis)
+table(clin_meta$IMDC, clin_meta$pulmonary)
+#one overlap so 16+16+9-1 = 40
+
+
+table(clin_meta$IMDC, clin_meta$Site)
+#   ARZ FLA RST
+#  0  40  25  96
+#  1   3   4   9
+table(clin_meta$hepatitis, clin_meta$Site)
+#    ARZ FLA RST
+#  0  41  29  91
+#  1   2   0  14
+table(clin_meta$pulmonary, clin_meta$Site)
+#    ARZ FLA RST
+#  0  41  28  99
+#  1   2   1   6
+
+table(clin_meta$IMDC, clin_meta$treatment_success_nr)
+#    1  2  3  4
+#  0 60 16 29 48
+#  1  5  2  1  7
+boxplot(clin_meta$treatment_success_nr ~ clin_meta$IMDC)
+
+table(clin_meta$hepatitis, clin_meta$treatment_success_nr) #n=52
+#    1  2  3  4
+#  0 60 17 27 49
+#  1  5  1  3  6
+
+t.test(clin_meta$treatment_success_nr ~ clin_meta$IMDC)
+#p-value = 0.5285
+
+t.test(clin_meta$treatment_success_nr ~ clin_meta$hepatitis)
+#p-value = 0.5142
+
+t.test(clin_meta$treatment_success_nr ~ clin_meta$pulmonary)
+#p-value = 0.4192
+
+table(clin_meta$any_toxicity, clin_meta$treatment_success_nr) 
+#    1  2  3  4
+#  0 31  8 15 22
+#  1 34 10 15 33
+
+
+```
+
+Plot stool and plasma sample vs. medication start date and time to irAE
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+filename <- "../figures/days difference histograms.png"
+png(filename, width = 10*330, height = 6*330, res = 330)
+
+par(mfrow=c(2,3))
+par(mar=c(4.5,4,2.5,2))
+
+hist(clin_meta$days_stool_med_start, breaks=20, las=1, main="Days between stool sample and ICI start", xlab="days", col="darkgrey", border = "darkgrey")
+hist(clin_meta$days_plasma_med_start, breaks=20, las=1, main="Days between plasma sample and ICI start", xlab="days", col="darkgrey", border = "darkgrey")
+
+hist(clin_meta$days_stool_irAE_onset, breaks=20, las=1, main="Days between stool sample and irAE onset", xlab="days", col="darkgrey", border = "darkgrey")
+hist(clin_meta$days_plasma_irAE_onset, breaks=20, las=1, main="Days between plasma sample and irAE onset", xlab="days", col="darkgrey", border = "darkgrey")
+hist(clin_meta$days_med_irAE_onset, breaks=20, las=1, main="Days between ICI start and irAE onset", xlab="days", col="darkgrey", border = "darkgrey")
+
+dev.off()
+
+
+```
+
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+clin_meta$pneumonitis <- clin_meta$pulmonary
+
+clin_meta$other_irAE <- 0
+
+clin_meta$other_irAE[rowSums(clin_meta[,c("cutaneous",                                                  
+              "thyroid",                                                    
+              "musculoskeletal",                                           
+              "adrenal",                                                    
+              "pancreatic",                                                 
+              "renal",                                                      
+              "cardiovascular")]) > 0] <- 1
+
+table(clin_meta$other_irAE)
+# 0   1 
+#108  69 
+
+
+```
+
+Make the timeline plot for samples relative to irAE
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+# List your desired columns
+selected_cols <- c(
+  "days_stool_med_start",
+  "days_plasma_med_start",
+  "days_stool_irAE_onset",
+  "days_plasma_irAE_onset",
+  "days_med_irAE_onset",
+  "IMDC",
+  "hepatitis",
+  "pneumonitis"
+)
+
+# Subset the dataframe
+clin_meta_subset <- clin_meta[, selected_cols]
+
+#Write to CSV
+#write.csv(clin_meta_subset, "../data/clin_meta_subset.csv", row.names = FALSE)
+
+df <- clin_meta_subset
+
+
+```
+
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+
+# Create a patient ID column for y-axis
+df$patient_id <- 1:nrow(df)
+
+# Assign irAE category
+irAE_labels <- c("IMDC", "Hepatitis", "Pneumonitis", "Other irAE", "No irAE")
+df$irAE_category <- "No irAE"
+df$irAE_category[df$IMDC == 1] <- "IMDC"
+df$irAE_category[df$hepatitis == 1] <- "Hepatitis"
+df$irAE_category[df$pneumonitis == 1] <- "Pneumonitis"
+df$irAE_category[!is.na(df$days_med_irAE_onset) & 
+                  df$IMDC == 0 & 
+                  df$hepatitis == 0 & 
+                  df$pneumonitis == 0] <- "Other irAE"
+
+# Prepare data for plotting (exclude Med Start from points)
+plot_data <- data.frame()
+
+# Add stool sample points
+stool_data <- data.frame(
+  patient_id = df$patient_id,
+  day = df$days_stool_med_start,
+  event_type = "Stool Sample",
+  irAE_category = df$irAE_category
+)
+plot_data <- rbind(plot_data, stool_data)
+
+# Add plasma sample points
+plasma_idx <- which(!is.na(df$days_plasma_med_start))
+if(length(plasma_idx) > 0) {
+  plasma_data <- data.frame(
+    patient_id = df$patient_id[plasma_idx],
+    day = df$days_plasma_med_start[plasma_idx],
+    event_type = "Plasma Sample",
+    irAE_category = df$irAE_category[plasma_idx]
+  )
+  plot_data <- rbind(plot_data, plasma_data)
+}
+
+# Add irAE events with specific types
+irae_idx <- which(!is.na(df$days_med_irAE_onset))
+if(length(irae_idx) > 0) {
+  for(i in irae_idx) {
+    irae_type <- "Other irAE Event"
+    if(df$IMDC[i] == 1) {
+      irae_type <- "IMDC Event"
+    } else if(df$hepatitis[i] == 1) {
+      irae_type <- "Hepatitis Event"
+    } else if(df$pneumonitis[i] == 1) {
+      irae_type <- "Pneumonitis Event"
+    }
+    irae_data <- data.frame(
+      patient_id = df$patient_id[i],
+      day = df$days_med_irAE_onset[i],
+      event_type = irae_type,
+      irAE_category = df$irAE_category[i]
+    )
+    plot_data <- rbind(plot_data, irae_data)
+  }
+}
+
+# Set factor levels for logical legend order
+plot_data$event_type <- factor(plot_data$event_type, levels = c(
+  "Stool Sample", 
+  "Plasma Sample",
+  "IMDC Event",
+  "Hepatitis Event",
+  "Pneumonitis Event",
+  "Other irAE Event"
+))
+
+plot_data$irAE_category <- factor(plot_data$irAE_category, levels = irAE_labels)
+plot_data <- plot_data[order(plot_data$irAE_category, plot_data$patient_id), ]
+
+# Get unique patient IDs per category for y-axis
+patient_facet_map <- unique(data.frame(
+  patient_id = plot_data$patient_id,
+  irAE_category = plot_data$irAE_category
+))
+patient_facet_map <- patient_facet_map[order(patient_facet_map$irAE_category, patient_facet_map$patient_id), ]
+patient_facet_map$y_pos <- ave(patient_facet_map$patient_id, patient_facet_map$irAE_category, FUN = seq_along)
+
+# Merge back to plot_data
+plot_data <- merge(plot_data, patient_facet_map, by = c("patient_id", "irAE_category"))
+
+# Calculate x-axis range
+x_min <- min(c(
+  0, df$days_stool_med_start, 
+  df$days_plasma_med_start[!is.na(df$days_plasma_med_start)], 
+  df$days_med_irAE_onset[!is.na(df$days_med_irAE_onset)]
+), na.rm = TRUE)
+x_max <- max(c(
+  0, df$days_stool_med_start, 
+  df$days_plasma_med_start[!is.na(df$days_plasma_med_start)], 
+  df$days_med_irAE_onset[!is.na(df$days_med_irAE_onset)]
+), na.rm = TRUE)
+
+# Create plot with vline for med start and updated colors
+p <- ggplot() +
+  # Add horizontal lines for each patient
+  geom_hline(data = patient_facet_map, aes(yintercept = y_pos), color = "gray90", linewidth = 0.3) +
+  # Add vertical line at day 0 for medication start
+  geom_vline(xintercept = 0, color = "black", linewidth = 0.5, linetype = "solid") +
+  # Add points for each event
+  geom_point(data = plot_data, aes(x = day, y = y_pos, color = event_type, shape = event_type), size = 2) +
+  scale_color_manual(
+    values = c(
+    "Stool Sample" = "#4DAF4AB3",
+    "Plasma Sample" = "#D95F02B3",
+    "IMDC Event" = "#E6AB02B3",
+    "Hepatitis Event" = "#7570B3B3",
+    "Pneumonitis Event" = "#1F78B4B3",
+    "Other irAE Event" = "#A9A9A9B3"
+    ),
+    breaks = c("Stool Sample", "Plasma Sample", 
+               "IMDC Event", "Hepatitis Event", "Pneumonitis Event", "Other irAE Event"),
+    name = "Event Type"
+  ) +
+  scale_shape_manual(
+    values = c(
+      "Stool Sample" = 17,
+      "Plasma Sample" = 15,
+      "IMDC Event" = 18,
+      "Hepatitis Event" = 18,
+      "Pneumonitis Event" = 18,
+      "Other irAE Event" = 18
+    ),
+    breaks = c("Stool Sample", "Plasma Sample", 
+               "IMDC Event", "Hepatitis Event", "Pneumonitis Event", "Other irAE Event"),
+    name = "Event Type"
+  ) +
+  scale_x_continuous(limits = c(x_min, x_max)) +
+  facet_grid(irAE_category ~ ., scales = "free_y", space = "free_y", switch = "y") +
+  labs(
+    title = "Patient Sampling Timeline by irAE Type",
+    x = "Days from Medication Start",
+    y = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = "right",
+    strip.text.y.left = element_text(angle = 0, hjust = 1, size = 10),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    plot.title = element_text(size = 10),
+    axis.title.x = element_text(size = 8)
+)
+
+# Display the plot
+print(p)
+
+# Optional: Save the plot
+ggsave("../figures/sampling_timeline_faceted_final.png", p, width = 6, height = 10, dpi = 300, bg = "white")
+
+
+```
+
+
+Bristol score and irAEs
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+#any_toxicity, IMDC, liver, pulmonary,  treatment_success_nr, treatment_success_best, Bristol_score_curated (not imputed)
+
+#IMDC
+boxplot(clin_meta$Bristol_score_curated ~ clin_meta$IMDC) #higher Bristol score so more diarrhea like for IMDC; mean is very similar tho
+summary(clin_meta$Bristol_score_curated[clin_meta$IMDC == 0])
+summary(clin_meta$Bristol_score_curated[clin_meta$IMDC == 1])
+wilcox.test(clin_meta$Bristol_score_curated ~ clin_meta$IMDC) #lowest p value of all >0.07005
+
+#liver / hepatitis
+boxplot(clin_meta$Bristol_score_curated ~ clin_meta$hepatitis)
+summary(clin_meta$Bristol_score_curated[clin_meta$liver == 0])
+summary(clin_meta$Bristol_score_curated[clin_meta$liver == 1])
+wilcox.test(clin_meta$Bristol_score_curated ~ clin_meta$hepatitis)
+
+#pulmonary / pneumonitis
+boxplot(clin_meta$Bristol_score_curated ~ clin_meta$pulmonary)
+summary(clin_meta$Bristol_score_curated[clin_meta$pulmonary == 0])
+summary(clin_meta$Bristol_score_curated[clin_meta$pulmonary == 1])
+wilcox.test(clin_meta$Bristol_score_curated ~ clin_meta$pulmonary)
+
+#any_toxicity
+boxplot(clin_meta$Bristol_score_curated ~ clin_meta$any_toxicity)
+summary(clin_meta$Bristol_score_curated[clin_meta$any_toxicity == 0])
+summary(clin_meta$Bristol_score_curated[clin_meta$any_toxicity == 1])
+wilcox.test(clin_meta$Bristol_score_curated ~ clin_meta$any_toxicity)
+
+#treatment_success_nr
+boxplot(clin_meta$Bristol_score_curated ~ clin_meta$treatment_success_nr)
+cor.test(clin_meta$Bristol_score_curated, clin_meta$treatment_success_nr, method="spearman")
+
+
+```
+
+Impute Bristol score and BMI
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+clin_meta$Bristol_score_imputed <- clin_meta$Bristol_score_curated
+clin_meta$Bristol_score_imputed[is.na(clin_meta$Bristol_score_curated)] <- floor(mean(clin_meta$Bristol_score_curated, na.rm = TRUE))
+
+clin_meta$BMI[is.na(clin_meta$BMI)] <- median(clin_meta$BMI, na.rm = T)
+
+
+```
+
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+#linear model plot for Bristol score
+
+lm_res_list <- list(summary(lm(Bristol_score_curated ~ IMDC, data=clin_meta)),
+     summary(lm(Bristol_score_curated ~ hepatitis, data=clin_meta)),
+     summary(lm(Bristol_score_curated ~ pneumonitis, data=clin_meta)),
+     summary(lm(Bristol_score_curated ~ other_irAE, data=clin_meta)),
+     summary(lm(Bristol_score_curated ~ abx_last_month, data=clin_meta)),
+     summary(lm(Bristol_score_curated ~ Age, data=clin_meta)),
+     summary(lm(Bristol_score_curated ~ BMI, data=clin_meta)),
+     summary(lm(Bristol_score_curated ~ Sex, data=clin_meta)),
+     summary(lm(Bristol_score_curated ~ Elixhauser_elix.sum, data=clin_meta)))
+
+
+
+
+coeff <- as.numeric(lapply(lm_res_list, function(x) x$coefficients[2,"Estimate"]))
+pvals <- as.numeric(lapply(lm_res_list, function(x) x$coefficients[2,"Pr(>|t|)"]))
+var_names <- as.character(lapply(lm_res_list, function(x) rownames(x$coefficients)[2]))
+
+res_df <- as.data.frame(cbind(coeff, pvals), row.names = var_names)
+res_df <- res_df[order(res_df$coeff, decreasing = F),]
+
+
+#varying color for p values
+#n of group size
+par(mar=c(4,14,1,1))
+barplot(res_df$coeff, horiz = T, las=1, col = res_df$pvals < 0.05, names.arg = rownames(res_df))
+mtext("lm Beta coefficient", line=2.5, side=1)
+
+min(p.adjust(res_df$pvals, "fdr"))
+
+
+filename <- "../figures/barplot Bristol_score_curated linear model manuscript.png"
+png(filename, width = 7*330, height = 3.5*330, res = 330)
+par(mar=c(4,14,1,1))
+barplot(res_df$coeff, horiz = T, las=1, col = res_df$pvals < 0.05, names.arg = rownames(res_df), main="Bristol Stool Form Scale linear model")
+mtext("lm Beta coefficient", line=2.5, side=1)
+dev.off()
+
+
+
+```
+
+
+Heatmap with side effects
+Simplify regimen names, CTLA4 PD1/PDL1, Chemo
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+#label subjects by drugs
+clin_meta$drug_regimen_simple <- clin_meta$ICI_combined
+
+clin_meta$drug_regimen_simple[which(clin_meta$PDL1)] <- "PD(L)1"
+clin_meta$drug_regimen_simple[which(clin_meta$CTLA4)] <- "CTLA4"
+clin_meta$drug_regimen_simple[which(clin_meta$PDL1 + clin_meta$CTLA4 == 2)] <- "Combination"
+
+#add chemo; not complete so not done now
+chemo_rows <- grep("Chemotherapy", clin_meta$class_med)
+clin_meta$drug_regimen_simple[chemo_rows] <- paste(clin_meta$drug_regimen_simple[chemo_rows], "+ Chemotherapy")
+
+table(clin_meta$drug_regimen_simple)
+
+regimen_names <- c("Combination", "Combination + Chemotherapy", "PD(L)1", "PD(L)1 + Chemotherapy")
+
+#regimen_names <- c("Combination", "PD(L)1")
+
+
+```
+
+Only for the 3 main side effect, collapse the others into "other"
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+
+table(clin_meta$pulmonary, clin_meta$IMDC) #1 with colitis also had pulmonary
+table(clin_meta$hepatitis, clin_meta$IMDC) #no overlap between liver and IMDC
+table(clin_meta$hepatitis, clin_meta$pulmonary) ##no overlap between liver and pulmonary
+
+
+irAE_df <- clin_meta[, c("IMDC", 
+              "hepatitis", 
+              "pulmonary",                                                  
+              "other_irAE")]
+
+colnames(irAE_df) <- c("IMDC", 
+              "Hepatitis", 
+              "Pneumonitis",                                                  
+              "Other irAE")
+
+apply(irAE_df, 2, table)
+table(clin_meta$any_toxicity)
+# 0   1 
+# 80 97 
+
+#color scheme
+sel_colors_dark <- c(brewer.pal(7, "Dark2"))
+sel_colors_paired <- c(brewer.pal(6, "Paired"))[c(2)]
+comb_colors <- c(sel_colors_dark, sel_colors_paired, "black", "darkgrey")
+#length(strain_colors)
+blue_cols <- RColorBrewer::brewer.pal(7, "Blues")
+
+drug_regimen_vec <- clin_meta$drug_regimen_simple
+
+set.seed(42)
+irAE_heatmap <- Heatmap(irAE_df, col = c(blue_cols[1], blue_cols[7]), name="irAE", row_names_gp=gpar(fontsize=7),
+                        column_split = 4, cluster_rows = T) + 
+   rowAnnotation(regimen = drug_regimen_vec,
+      col = list(regimen = c("Combination + Chemotherapy" = "#E6AB02", "Combination" = "#D95F02", 
+                            "PD(L)1" = "#1F78B4", "PD(L)1 + Chemotherapy" = "#7570B3")))
+
+irAE_heatmap
+
+
+filename <- "../figures/irAE heatmap selected irAE simple regimen.png"
+png(filename, width = 3.75*330, height = 7.5*330, res = 330)
+irAE_heatmap
+dev.off()
+
+```
+
+
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+
+drug_regimen_vec <- clin_meta$drug_regimen_simple
+
+column_ha = HeatmapAnnotation(regimen = drug_regimen_vec,col = list(regimen = c("Combination + Chemotherapy" = "#E6AB02", "Combination" = "#D95F02", 
+                            "PD(L)1" = "#1F78B4", "PD(L)1 + Chemotherapy" = "#7570B3")), simple_anno_size = unit(0.8, "cm"), annotation_name_gp=gpar(fontsize = 14))
+
+#column_ha = HeatmapAnnotation(regimen = drug_regimen_vec,col = list(regimen = c("Combination" = "#D95F02", 
+#                            "PD(L)1" = "#1F78B4")), simple_anno_size = unit(0.8, "cm"), annotation_name_gp=gpar(fontsize = 14))
+
+
+colnames(irAE_df) <- c("IMDC, n=16", "Hepatitis, n=16", "Pneumonitis, n=9", "Other irAE, n=69")
+
+
+set.seed(42)
+irAE_heatmap <- Heatmap(t(irAE_df), col = c(blue_cols[1], blue_cols[7]), name="irAE", column_names_gp=gpar(fontsize=7), show_column_names=F,
+                        row_split = 4, row_title = rep("", 4), cluster_rows = T, cluster_columns = T, top_annotation = column_ha, show_row_dend = F, 
+                        show_column_dend = F, row_names_gp = gpar(fontsize = 14))
+  
+irAE_heatmap
+
+filename <- "../figures/irAE heatmap selected irAE simple regimen horizontal.png"
+png(filename, width = 13*330, height = 2*330, res = 330)
+irAE_heatmap
+dev.off()
+
+
+
+```
+
+Try upset plot for the same data
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+
+# Create a binary data frame for UpSet plot
+# Assuming irAE_df is your matrix with samples as rows and irAE types as columns
+# Convert to data frame with proper column names
+upset_df <- as.data.frame(irAE_df)
+colnames(upset_df) <- c("IMDC", "Hepatitis", "Pneumonitis", "Other irAE")
+# Add regimen information
+upset_df$regimen <- clin_meta$drug_regimen_simple
+
+# Convert to logical (TRUE/FALSE) for UpSet
+upset_df[,1:4] <- upset_df[,1:4] == 1
+
+
+# Create the UpSet plot
+#upset(upset_df, 
+#      intersect = c("IMDC", "Hepatitis", "Pneumonitis", "Other irAE"),
+#      name = "irAE Type",
+#      width_ratio = 0.2,
+#      set_sizes = (
+#        upset_set_size()
+#        + geom_text(aes(label=..count..), hjust=1.1, stat='count', size=4.5)
+#        + theme(axis.text.x = element_text(size=12, angle=0))
+#      ),
+#      base_annotations = list(
+#        'Intersection size' = (
+#          intersection_size(
+#            text = list(size=4.5),
+#            bar_number_threshold = 1
+#          )
+#          + theme(text = element_text(size=12))
+#        )
+#      ),
+#      themes = upset_default_themes(text = element_text(size=12))
+#)
+
+
+# If you want to color by regimen, you can add:
+p <- upset(upset_df, 
+      intersect = c("IMDC", "Hepatitis", "Pneumonitis", "Other irAE"),
+      name = "irAE Type",
+      width_ratio = 0.45,
+      height_ratio = 0.6,
+      set_sizes = (
+        upset_set_size(
+          geom = geom_bar(
+            aes(fill=regimen),
+            width = 0.8
+          ),
+          position = 'right'
+        )
+        + ylim(0, 80)
+        + scale_fill_manual(
+          values = c("Combination + Chemotherapy" = "#E6AB02", 
+                    "Combination" = "#D95F02",
+                    "PD(L)1" = "#1F78B4", 
+                    "PD(L)1 + Chemotherapy" = "#7570B3"
+                    ), na.value = "white"
+        )
+        + geom_text(aes(label=..count..), hjust=0.8, stat='count', size=4.5)
+        + theme(
+          axis.text.x = element_text(size=10, colour="white"),
+          axis.text.y = element_text(colour="white"),
+          axis.title = element_text(size=10, colour="black"),
+          panel.grid = element_blank()
+          )
+        #+ guides(fill = "none")
+      ),
+      base_annotations = list(
+        'Intersection size' = (
+          intersection_size(
+            aes(fill=regimen),
+            text = list(size=4),
+            bar_number_threshold = 1
+          )
+          + ylim(0, 85)
+          + scale_fill_manual(
+            values = c("Combination + Chemotherapy" = "#E6AB02", 
+                      "Combination" = "#D95F02",
+                      "PD(L)1" = "#1F78B4", 
+                      "PD(L)1 + Chemotherapy" = "#7570B3"
+                      ), na.value = "white"
+          )
+          + theme(
+            axis.text.x = element_text(size=10, colour="white"),
+            axis.text.y = element_text(size=10, colour="black"),
+            axis.title = element_text(size=10, colour="black"),
+            panel.grid = element_blank()
+          )
+          + guides(fill = "none")
+        ) 
+      ),
+      themes = upset_default_themes(text = element_text(size=14), colour="black")
+)
+
+p
+
+ggsave("../figures/upset_plot_irAEregimens.png", plot = p, width = 10, height = 6, dpi = 300)
+
+
+
+
+```
+
+
+Treatment regimen and irAEs
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+#remove chemo for this analysis
+drug_regimen_simple_no_chemo <- clin_meta$drug_regimen_simple
+drug_regimen_simple_no_chemo <- gsub("\\+ Chemotherapy", "", drug_regimen_simple_no_chemo)
+drug_regimen_simple_no_chemo <- gsub(" ", "", drug_regimen_simple_no_chemo)
+
+clin_meta$drug_regimen_simple_no_chemo <- drug_regimen_simple_no_chemo
+
+
+#IMDC
+table(drug_regimen_simple_no_chemo, clin_meta$IMDC) 
+prop.test(table(drug_regimen_simple_no_chemo, clin_meta$IMDC)) #p-value = 0.062, 16.7% vs 10.6% on combination vs pd(l)1
+
+#liver / hepatitis
+table(drug_regimen_simple_no_chemo, clin_meta$hepatitis) 
+prop.test(table(drug_regimen_simple_no_chemo, clin_meta$hepatitis)) #p-value = 0.494
+
+#pulmonary / pneumonitis
+table(drug_regimen_simple_no_chemo, clin_meta$pulmonary) 
+prop.test(table(drug_regimen_simple_no_chemo, clin_meta$pulmonary)) #p-value = 1
+
+#other toxicity
+table(drug_regimen_simple_no_chemo, clin_meta$other_irAE) 
+prop.test(table(drug_regimen_simple_no_chemo, clin_meta$other_irAE)) #p-value = 0.785
+
+
+
+table(clin_meta$drug_regimen_simple, clin_meta$IMDC)
+
+table(clin_meta$drug_regimen_simple, clin_meta$hepatitis)
+
+table(clin_meta$drug_regimen_simple, clin_meta$pulmonary)
+
+table(clin_meta$drug_regimen_simple, clin_meta$other_irAE)
+
+
+```
+
+Circular plot with number of samples
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+
+donuts_RM <- function(x, group = 1, labels = NA, col = NULL, radius = c(.7, 1),
+                      col.sub=col.sub) {
+  group <- rep_len(group, length(x))
+  ug  <- unique(group)
+  tbl <- table(group)[order(ug)]
+
+  col <- if (is.null(col))
+    seq_along(ug) else rep_len(col, length(ug))
+  col.main <- Map(rep, col[seq_along(tbl)], tbl)
+
+  plot.new()
+
+  par(new = TRUE)
+  pie(x, border = NA, radius = radius[2L],
+      col = unlist(col.sub), labels = labels, cex = 1.4)
+
+  par(new = TRUE)
+  pie(x, border = NA, radius = radius[1L],
+      col = unlist(col.main), labels = NA)
+}
+
+
+
+
+
+donuts_RM_2_rings <- function(x, group = 1, group_outer = 1, labels_outer = NA, labels_inner = NA, col = NULL, radius = c(.7, 0.9, 1), 
+                      col.sub = col.sub, col.outer=col.outer) {
+  
+  group <- rep_len(group, length(x))
+  ug  <- unique(group)
+  tbl <- table(group)[order(ug)]
+  col <- if (is.null(col))
+    seq_along(ug) else rep_len(col, length(ug))
+  col.main <- Map(rep, col[seq_along(tbl)], tbl)
+
+
+  plot.new()
+  # Draw the outermost ring
+  par(new = TRUE)
+  pie(x, border = NA, radius = radius[3L],
+      col = unlist(col.outer), labels = labels_inner)
+
+  # Draw the second ring
+  par(new = TRUE)
+  pie(x, border = NA, radius = radius[2L],
+      col = unlist(col.main), labels = NA)
+
+  # Draw the innermost ring
+  par(new = TRUE)
+  pie(x, border = NA, radius = radius[1L],
+      col = unlist(col.sub), labels = NA)
+}
+
+
+
+
+
+```
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+
+#circlize package
+
+#' x      numeric vector for each slice
+#' group  vector identifying the group for each slice
+#' labels vector of labels for individual slices
+#' col    colors for each group
+#' radius radius for inner and outer pie (usually in [0,1])
+
+
+#head(clin_meta)
+#nrow(clin_meta) #183; all alpha diversity and species
+#functional metagenomics 183 as well
+#table(is.na(clin_meta$SampleID_Olink_Inflammation)) #149
+#table(is.na(clin_meta$SampleID_untargeted_LCMS)) #149
+#table(is.na(clin_meta$Stool_metabolomics_SampleID)) #172
+
+sel_colors <- brewer.pal(8, "Dark2")
+#switch the green out for blue
+sel_colors[1] <- "#1F78B4"
+
+#make alpha
+sel_colors_alpha <- adjustcolor(sel_colors, alpha.f = 1)
+
+
+plot(1:8, 1:8, col=sel_colors, pch=16, cex=10)
+plot(1:8, 1:8, col=sel_colors_alpha, pch=16, cex=10)
+
+
+measurement_df <- as.data.frame(cbind(data_type=c("metagenomics", "metagenomics", "metagenomics", "metabolomics", 
+                                                  "metabolomics", "metabolomics", "olink"), 
+                                      sample_type=c("stool", "stool","stool","stool", "plasma", "plasma", "plasma"),
+                                      measurement=c("alpha diversity n=177", "species n=177", "functional pathways n=177",
+                                                    "stool targeted n=167", "plasma untargeted neg n=145", "plasma untargeted pos n=145", 
+                                                    "cytokines n=145"), 
+                                      label=c("alpha diversity\nn=177", "species\nn=177, d=5740\n\n", "functional pathways\nn=177, d=519",
+                                              "targeted\nn=167, d=563", "\nuntargeted neg \nn=145, d=4968", "\nuntargeted pos \nn=145, d=6782", 
+                                              "immune proteins\nn=145, d=72"), 
+                                      group_outer=c("microbial", "microbial", "microbial", "microbial", "microbial+host", 
+                                                    "microbial+host", "host"),
+                                      share=c(100/7, 100/7, 100/7, 100/7, 100/7, 100/7, 100/7)))
+
+#microbial, shared, host
+
+
+svg("../figures/measurement types n and d.svg", width=7, height=7)
+
+par(mar = c(4,8,4,8))
+donuts_RM(as.numeric(measurement_df$share), group = measurement_df$data_type, labels= measurement_df$label,
+          col = c(sel_colors[2],sel_colors[3],sel_colors[8]), col.sub=sel_colors_alpha[c(1,6,8)][as.factor(measurement_df$sample_type)])
+
+text(0,0.3,"metagenomics", cex=1.4)
+text(-0.2,-0.3,"metabolomics", cex=1.4)
+text(0.4,-0.2,"Olink", cex=1.4)
+
+text(-0.5,0.7,"stool", cex=1.4)
+text(0.3,-0.8,"plasma", cex=1.4)
+
+dev.off()
+
+
+#png 
+png("../figures/measurement types n and d.png", width=7*300, height=7*300, res=300)
+
+par(mar = c(4,8,4,8))
+donuts_RM(as.numeric(measurement_df$share), group = measurement_df$data_type, labels= measurement_df$label,
+          col = c(sel_colors[2],sel_colors[3],sel_colors[8]), col.sub=sel_colors_alpha[c(1,6,8)][as.factor(measurement_df$sample_type)])
+
+text(0,0.3,"metagenomics", cex=1.4)
+text(-0.2,-0.3,"metabolomics", cex=1.4)
+text(0.4,-0.2,"Olink", cex=1.4)
+
+text(-0.5,0.7,"stool", cex=1.4)
+text(0.3,-0.8,"plasma", cex=1.4)
+
+dev.off()
+
+
+
+
+#---------------------------
+#version without d= numbers 
+#color names with microbial, host, mixed; do this in illustrator .svg
+
+measurement_df$label2 <- c("alpha diversity\nn=177", "species\nn=177", "functional genes\nn=177",
+                                              "targeted\nn=167", "\nuntargeted - \nn=145", "\nuntargeted + \nn=145", 
+                                              "immune proteins\nn=145")
+
+svg("../figures/measurement types n.svg", width=7, height=7)
+
+par(mar = c(4,8,4,8))
+donuts_RM(as.numeric(measurement_df$share), group = measurement_df$data_type, labels= measurement_df$label2,
+          col = c(sel_colors[2],sel_colors[3],sel_colors[8]), col.sub=sel_colors_alpha[c(1,6,8)][as.factor(measurement_df$sample_type)])
+
+text(0,0.3,"metagenomics", cex=1.4)
+text(-0.2,-0.3,"metabolomics", cex=1.4)
+text(0.4,-0.2,"Olink", cex=1.4)
+
+text(-0.5,0.7,"stool", cex=1.4)
+text(0.3,-0.8,"plasma", cex=1.4)
+
+dev.off()
+
+
+
+
+```
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+table(clin_meta$treatment_success_nr)
+
+clin_meta$"Cancer stage at time of ICI initiation" <- clin_meta$Cancer.stage.at.time.of.ICI.initiation
+clin_meta$"Cancer stage at time of ICI initiation"[is.na(clin_meta$Cancer.stage.at.time.of.ICI.initiation)] <- "Not available"
+
+table(clin_meta$`Cancer stage at time of ICI initiation`)
+
+#sequencing batch
+#with plasma omics
+#with stool metabolomics
+
+clin_meta$"sequencing batch" <- as.numeric(gsub("Batch|_reseq", "", clin_meta$Batch))
+clin_meta$"with plasma omics" <- ifelse(!is.na(clin_meta$SampleID_untargeted_LCMS), "yes", "no")
+clin_meta$"with stool metabolomics" <- ifelse(!is.na(clin_meta$Stool_metabolomics_SampleID), "yes", "no")
+
+
+```
+
+
+Minimal outcomes table, treatment_success_nr is not available for everyone
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+
+summary_tbl <- clin_meta %>%
+  select(treatment_success_nr, Age, BMI, Sex, "Cancer stage at time of ICI initiation") %>%
+  tbl_summary(
+    by = treatment_success_nr, 
+    missing = "no",
+    statistic = all_continuous() ~ "{median} ({p25}, {p75})",
+    type = list(Age ~ "continuous", BMI ~ "continuous", Sex ~ "categorical", "Cancer stage at time of ICI initiation" ~ "categorical"),
+    sort = all_categorical() ~ "frequency"
+  ) %>%
+  add_p() %>%
+  modify_header(all_stat_cols() ~ "**{level}**<br>N = {n} ({style_percent(p)}%)") %>%
+  add_n() %>%
+  bold_labels() %>%
+  modify_spanning_header(all_stat_cols() ~ "**Treatment success and staging**")
+
+
+knitr::knit_print(summary_tbl)
+
+
+```
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+
+colnames(clin_meta) <- gsub("Malignancy.For.which.ICI.was.indicated", "Malignancy", colnames(clin_meta))
+
+summary_tbl <- clin_meta %>%
+  select(treatment_success_nr, Age, BMI, Sex, Malignancy, ICI_combined) %>%
+  tbl_summary(
+    by = treatment_success_nr, 
+    missing = "no",
+    statistic = all_continuous() ~ "{median} ({p25}, {p75})",
+    type = list(Age ~ "continuous", BMI ~ "continuous", Sex ~ "categorical", ICI_combined ~ "categorical"),
+    sort = all_categorical() ~ "frequency"
+  ) %>%
+  add_p() %>%
+  modify_header(all_stat_cols() ~ "**{level}**<br>N = {n} ({style_percent(p)}%)") %>%
+  add_n() %>%
+  bold_labels() %>%
+  modify_spanning_header(all_stat_cols() ~ "**Treatment success (RECIST)**")
+
+
+knitr::knit_print(summary_tbl)
+
+
+```
+
+High level treatment 
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+clin_meta$treatment_success_nr_test <- clin_meta$treatment_success_nr
+clin_meta$treatment_success_nr_test[is.na(clin_meta$treatment_success_nr_test)] <- "Not\navailable"
+
+
+clin_meta$"Simplified drug regimen" <- clin_meta$drug_regimen_simple
+
+low_prev <- names(table(clin_meta$Malignancy)[table(clin_meta$Malignancy) < 3])
+clin_meta$Malignancy[clin_meta$Malignancy %in% low_prev] <- "Other"
+
+
+summary_tbl <- clin_meta %>%
+  select(treatment_success_nr_test, Age, BMI, Sex, Malignancy, "Simplified drug regimen") %>%
+  tbl_summary(
+    by = treatment_success_nr_test, 
+    missing = "no",
+    statistic = all_continuous() ~ "{median} ({p25}, {p75})",
+    type = list(Age ~ "continuous", BMI ~ "continuous", Sex ~ "categorical", "Simplified drug regimen" ~ "categorical"),
+    sort = all_categorical() ~ "frequency"
+  ) %>%
+  add_p() %>%
+  modify_header(all_stat_cols() ~ "**{level}**<br>N = {n} ({style_percent(p)}%)") %>%
+  bold_labels() %>%
+  modify_spanning_header(all_stat_cols() ~ "**Treatment success (RECIST)   1=PD ; 2=SD ; 3=PR ; 4=CR**")
+
+
+knitr::knit_print(summary_tbl)
+
+
+
+```
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+
+#make the table from above in heatmap form and add IMDC, hepatitis, pneumonitis
+clin_meta_table <- clin_meta[,c("treatment_success_nr_test", "Age", "BMI", "Sex", "Malignancy", "Simplified drug regimen",
+                                "IMDC", "hepatitis", "pulmonary", "other_irAE", "Elixhauser_elix.sum",
+                                "sequencing batch", "with plasma omics", "with stool metabolomics")]
+names(clin_meta_table)[names(clin_meta_table) == "hepatitis"] <- "Hepatitis"
+names(clin_meta_table)[names(clin_meta_table) == "pulmonary"] <- "Pneumonitis"
+names(clin_meta_table)[names(clin_meta_table) == "other_irAE"] <- "Other irAE"
+names(clin_meta_table)[names(clin_meta_table) == "Elixhauser_elix.sum"] <- "Elixhauser score"
+clin_meta_table$`Elixhauser score` <- as.numeric(clin_meta_table$`Elixhauser score`)
+
+#get percentages and averages by treatment_success_nr_test
+low_prev <- names(table(clin_meta_table$Malignancy)[table(clin_meta_table$Malignancy) < 6])
+clin_meta_table$Malignancy[clin_meta_table$Malignancy %in% low_prev] <- "Other"
+
+
+summary_tbl_2 <- clin_meta_table %>%
+  select(treatment_success_nr_test, Age, BMI, Sex, Malignancy, "Elixhauser score", "Simplified drug regimen", "IMDC", "Hepatitis", "Pneumonitis", "Other irAE") %>%
+  tbl_summary(
+    by = treatment_success_nr_test, 
+    missing = "no",
+    #statistic = all_continuous() ~ "{median} ({p25}, {p75})",
+    type = list(Age ~ "continuous", BMI ~ "continuous", "Elixhauser score" ~ "continuous", 
+                Sex ~ "categorical", "Simplified drug regimen" ~ "categorical"),
+    sort = all_categorical() ~ "frequency"
+  ) %>%
+  add_p(
+    test = list(
+      Age ~ "kruskal.test",
+      BMI ~ "kruskal.test",
+      Sex ~ "kruskal.test", 
+      "Simplified drug regimen" ~ "kruskal.test",
+      "Elixhauser score" ~ "cor.test"
+      ),
+      test.args = list(
+        "Elixhauser score" ~ list(method="spearman")
+      )
+    ) %>% 
+  modify_header(all_stat_cols() ~ "**{level}**<br>N = {n} ({style_percent(p)}%)") %>%
+  bold_labels() %>%
+  modify_spanning_header(all_stat_cols() ~ "**Treatment success (RECIST)   1=PD ; 2=SD ; 3=PR ; 4=CR**")
+  
+
+theme_gtsummary_compact()
+summary_tbl_2
+
+knitr::knit_print(summary_tbl_2)
+
+
+summary_tbl_2 %>%
+  as_gt() %>%
+  gt::gtsave(filename = "../figures/cohort_table.docx")
+
+
+gt_tbl <- as_gt(summary_tbl_2)
+# Save to png
+gtsave(gt_tbl, "../figures/cohort_table.png", zoom = 3)
+
+
+```
+
+IMDC expanded tables
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+
+clin_meta_table_copy <- clin_meta_table
+clin_meta_table_copy$treatment_success_nr_test[clin_meta_table_copy$treatment_success_nr_test == "1"] <- "PD"
+clin_meta_table_copy$treatment_success_nr_test[clin_meta_table_copy$treatment_success_nr_test == "2"] <- "SD"
+clin_meta_table_copy$treatment_success_nr_test[clin_meta_table_copy$treatment_success_nr_test == "3"] <- "PR"
+clin_meta_table_copy$treatment_success_nr_test[clin_meta_table_copy$treatment_success_nr_test == "4"] <- "CR"
+clin_meta_table_copy$"Treatment success" <- clin_meta_table_copy$treatment_success_nr_test
+
+
+summary_tbl_2 <- clin_meta_table_copy %>%
+  select("Treatment success", Age, BMI, Sex, Malignancy, "sequencing batch", "with plasma omics", "with stool metabolomics", 
+         "Elixhauser score", "Simplified drug regimen", "IMDC") %>%
+  tbl_summary(
+    by = IMDC, 
+    missing = "no",
+    #statistic = all_continuous() ~ "{median} ({p25}, {p75})",
+    type = list(Age ~ "continuous", BMI ~ "continuous", "Elixhauser score" ~ "continuous", 
+                Sex ~ "categorical", "Simplified drug regimen" ~ "categorical"),
+    sort = all_categorical() ~ "frequency"
+  ) %>%
+  add_p(
+    test = list(
+      Age ~ "kruskal.test",
+      BMI ~ "kruskal.test",
+      Sex ~ "kruskal.test", 
+      "Simplified drug regimen" ~ "kruskal.test",
+      "Elixhauser score" ~ "cor.test"
+      ),
+      test.args = list(
+        "Elixhauser score" ~ list(method="spearman")
+      )
+    ) %>% 
+  modify_header(all_stat_cols() ~ "**{level}**<br>N = {n} ({style_percent(p)}%)") %>%
+  bold_labels() %>%
+  modify_spanning_header(all_stat_cols() ~ "**Immune-Mediated Diarrhea/Colitis**")
+  
+
+theme_gtsummary_compact()
+summary_tbl_2
+
+knitr::knit_print(summary_tbl_2)
+
+summary_tbl_2 %>%
+  as_gt() %>%
+  gt::gtsave(filename = "../figures/cohort_table IMDC.docx")
+
+
+
+gt_tbl <- as_gt(summary_tbl_2)
+# Save to png
+gtsave(gt_tbl, "../figures/cohort_table IMDC.png", zoom = 3)
+
+
+```
+
+Hepatitis cohort table
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+summary_tbl_2 <- clin_meta_table_copy %>%
+  select("Treatment success", Age, BMI, Sex, Malignancy, "sequencing batch", "with plasma omics", "with stool metabolomics", 
+         "Elixhauser score", "Simplified drug regimen", "Hepatitis") %>%
+  tbl_summary(
+    by = Hepatitis, 
+    missing = "no",
+    #statistic = all_continuous() ~ "{median} ({p25}, {p75})",
+    type = list(Age ~ "continuous", BMI ~ "continuous", "Elixhauser score" ~ "continuous", 
+                Sex ~ "categorical", "Simplified drug regimen" ~ "categorical"),
+    sort = all_categorical() ~ "frequency"
+  ) %>%
+  add_p(
+    test = list(
+      Age ~ "kruskal.test",
+      BMI ~ "kruskal.test",
+      Sex ~ "kruskal.test", 
+      "Simplified drug regimen" ~ "kruskal.test",
+      "Elixhauser score" ~ "cor.test"
+      ),
+      test.args = list(
+        "Elixhauser score" ~ list(method="spearman")
+      )
+    ) %>% 
+  modify_header(all_stat_cols() ~ "**{level}**<br>N = {n} ({style_percent(p)}%)") %>%
+  bold_labels() %>%
+  modify_spanning_header(all_stat_cols() ~ "**Hepatitis**")
+  
+
+theme_gtsummary_compact()
+summary_tbl_2
+
+knitr::knit_print(summary_tbl_2)
+
+summary_tbl_2 %>%
+  as_gt() %>%
+  gt::gtsave(filename = "../figures/cohort_table Hepatitis.docx")
+
+
+gt_tbl <- as_gt(summary_tbl_2)
+# Save to png
+gtsave(gt_tbl, "../figures/cohort_table Hepatitis.png", zoom = 3)
+
+
+```
+
+
+Pneumonitis more expanded version
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+summary_tbl_2 <- clin_meta_table_copy %>%
+  select("Treatment success", Age, BMI, Sex, Malignancy, "sequencing batch", "with plasma omics", "with stool metabolomics", 
+         "Elixhauser score", "Simplified drug regimen", "Pneumonitis") %>%
+  tbl_summary(
+    by = Pneumonitis, 
+    missing = "no",
+    #statistic = all_continuous() ~ "{median} ({p25}, {p75})",
+    type = list(Age ~ "continuous", BMI ~ "continuous", "Elixhauser score" ~ "continuous", 
+                Sex ~ "categorical", "Simplified drug regimen" ~ "categorical"),
+    sort = all_categorical() ~ "frequency"
+  ) %>%
+  add_p(
+    test = list(
+      Age ~ "kruskal.test",
+      BMI ~ "kruskal.test",
+      Sex ~ "kruskal.test", 
+      "Simplified drug regimen" ~ "kruskal.test",
+      "Elixhauser score" ~ "cor.test"
+      ),
+      test.args = list(
+        "Elixhauser score" ~ list(method="spearman")
+      )
+    ) %>% 
+  modify_header(all_stat_cols() ~ "**{level}**<br>N = {n} ({style_percent(p)}%)") %>%
+  bold_labels() %>%
+  modify_spanning_header(all_stat_cols() ~ "**Pneumonitis**")
+  
+
+theme_gtsummary_compact()
+summary_tbl_2
+
+knitr::knit_print(summary_tbl_2)
+
+summary_tbl_2 %>%
+  as_gt() %>%
+  gt::gtsave(filename = "../figures/cohort_table Pneumonitis.docx")
+
+
+gt_tbl <- as_gt(summary_tbl_2)
+# Save to png
+gtsave(gt_tbl, "../figures/cohort_table Pneumonitis.png", zoom = 3)
+
+
+```
+
+
+Abx and outcomes, not significant
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+table(clin_meta$abx_last_month, clin_meta$treatment_success_nr)
+
+#     1  2  3  4
+#  0 62 18 28 54
+#  1  6  0  3  3
+
+```

@@ -1,0 +1,202 @@
+---
+title: "ICI_analysis_LBP"
+author: "Ruben Mars"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+  
+
+output: 
+  html_document:
+    toc: true
+    theme: cerulean
+    
+---
+
+<style type="text/css">
+.main-container {
+  max-width: 1200px;
+  margin-left: auto;
+  margin-right: auto;
+}
+</style>
+
+***  
+
+## Content
+
+Olink inflammation data
+
+
+***  
+
+
+```{r, echo=FALSE, results='hide',message=FALSE}
+
+require(tidyverse)
+require(readxl)
+require(ggplot2)
+require(RColorBrewer)
+require(vegan)
+require(ape)
+require(tidyverse)
+require(ggpubr)
+require(cowplot)
+require(randomForest)
+require(ROCR)
+require(gtsummary)
+require(flextable)
+require(gridExtra)
+library(ggpubr)
+require(reshape2)
+require(dplyr)
+require(openxlsx)
+require(knitr)
+#library(devtools)
+#install_github("jokergoo/ComplexHeatmap")
+require(ComplexHeatmap)
+require(circlize)
+require(mlbench)
+require(caret)
+require(ropls)
+require(GUniFrac)
+require(GenericML)
+library(dplyr)
+library(tibble)
+library(ggrepel)
+require(lmerTest)
+
+source("helper functions/zicoseq_volcano_plot.R")
+source("helper functions/zicoseq_heatmap_old_colors.R")
+
+
+```
+
+
+Load data
+
+```{r, echo=FALSE, results='hide',message=FALSE}
+
+
+rmarkdown::render("1_ICI_cohort_description.Rmd")
+
+
+```
+
+
+
+Subset LBP data with clin data and put in same order
+
+```{r, echo=FALSE, results='hide',message=FALSE}
+
+clin_meta_LBP <- clin_meta[which(!is.na(clin_meta$LBP_conc_ng_ml)),]
+
+table(clin_meta_LBP$IMDC)
+#0   1 
+#131  14
+
+table(clin_meta_LBP$hepatitis)
+#0   1 
+#133  12
+
+table(clin_meta_LBP$pulmonary)
+# 0   1 
+#139  6
+
+table(clin_meta_LBP$other_irAE) 
+#0  1 
+#89 56
+
+clin_meta_LBP$BMI <- as.numeric(clin_meta_LBP$BMI)
+clin_meta_LBP$Age <- as.numeric(clin_meta_LBP$Age)
+
+
+```
+
+
+Check distribution
+
+```{r, echo=FALSE, results='hide',message=FALSE}
+
+
+data <- clin_meta_LBP$LBP_conc_ng_ml
+data_log10 <- log10(clin_meta_LBP$LBP_conc_ng_ml)
+
+hist(data, main="LBP", las=1, breaks=12, xlab="conc")
+hist(data_log10, main="LBP", las=1, breaks=12, xlab="conc")
+
+#log10 is normal so we can use standard stats
+
+
+```
+
+Run linear model on all relevant variables to see what needs corrected for
+
+```{r, echo=FALSE, results='hide',message=FALSE}
+
+#impute Bristol scores
+
+lm_res_list <- list(summary(lm(log10(LBP_conc_ng_ml) ~ IMDC, data=clin_meta_LBP)),
+     summary(lm(log10(LBP_conc_ng_ml) ~ hepatitis, data=clin_meta_LBP)),
+     summary(lm(log10(LBP_conc_ng_ml) ~ pneumonitis, data=clin_meta_LBP)),
+     summary(lm(log10(LBP_conc_ng_ml) ~ other_irAE, data=clin_meta_LBP)),
+     summary(lm(log10(LBP_conc_ng_ml) ~ abx_last_month, data=clin_meta_LBP)),
+     summary(lm(log10(LBP_conc_ng_ml) ~ Age, data=clin_meta_LBP)),
+     summary(lm(log10(LBP_conc_ng_ml) ~ BMI, data=clin_meta_LBP)),
+     summary(lm(log10(LBP_conc_ng_ml) ~ Sex, data=clin_meta_LBP)),
+     summary(lm(log10(LBP_conc_ng_ml) ~ Bristol_score_imputed, data=clin_meta_LBP)),
+     summary(lm(log10(LBP_conc_ng_ml) ~ Elixhauser_elix.sum, data=clin_meta_LBP)))
+
+coeff <- as.numeric(lapply(lm_res_list, function(x) x$coefficients[2,"Estimate"]))
+pvals <- as.numeric(lapply(lm_res_list, function(x) x$coefficients[2,"Pr(>|t|)"]))
+var_names <- as.character(lapply(lm_res_list, function(x) rownames(x$coefficients)[2]))
+
+res_df <- as.data.frame(cbind(coeff, pvals), row.names = var_names)
+res_df <- res_df[order(res_df$coeff, decreasing = F),]
+
+
+#varying color for p values
+#n of group size
+par(mar=c(4,14,1,1))
+barplot(res_df$coeff, horiz = T, las=1, col = res_df$pvals < 0.05, names.arg = rownames(res_df))
+mtext("lm Beta coefficient", line=2.5, side=1)
+
+
+min(res_df$pvals)
+#0.22
+min(p.adjust(res_df$pvals, "fdr"))
+
+
+filename <- "../figures/barplot LBP linear model manuscript.png"
+png(filename, width = 7*330, height = 3.5*330, res = 330)
+par(mar=c(4,14,1,1))
+barplot(res_df$coeff, horiz = T, las=1, col = res_df$pvals < 0.05, names.arg = rownames(res_df), main="LBP linear model")
+mtext("lm Beta coefficient", line=2.5, side=1)
+dev.off()
+
+```
+
+
+Group comparisons on IMDC, correct for abx use
+
+```{r, echo=FALSE, message=FALSE}
+
+table(clin_meta_LBP$IMDC, clin_meta_LBP$abx_last_month) #only 1 subject with IMDC got abx
+
+t.test(log10(LBP_conc_ng_ml) ~ abx_last_month, data=clin_meta_LBP) #trending but not significant
+boxplot(log10(LBP_conc_ng_ml) ~ abx_last_month, data=clin_meta_LBP, varwidth=T)
+
+#-------------------------------------------------------------------------------
+#correct for abx_last_month use, improves p-value very slightly in case of IMDC
+
+summary(lm(log10(LBP_conc_ng_ml) ~ IMDC, data=clin_meta_LBP))
+summary(lm(log10(LBP_conc_ng_ml) ~ IMDC + abx_last_month, data=clin_meta_LBP))
+
+summary(lm(log10(LBP_conc_ng_ml) ~ cutaneous, data=clin_meta_LBP))
+summary(lm(log10(LBP_conc_ng_ml) ~ cutaneous + abx_last_month, data=clin_meta_LBP))
+
+summary(lm(log10(LBP_conc_ng_ml) ~ any_toxicity, data=clin_meta_LBP))
+summary(lm(log10(LBP_conc_ng_ml) ~ any_toxicity + abx_last_month, data=clin_meta_LBP))
+
+
+
+```
+

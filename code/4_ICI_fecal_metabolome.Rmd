@@ -1,0 +1,1313 @@
+---
+title: "ICI_fecal_metabolome"
+author: "Ruben Mars"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+params:
+  
+  read_MannWhitney_fun: "helper functions/MannWhitney_function.R"
+  read_boxplot_fun: "helper functions/make_boxplot_figure.R"
+  replace_outliers_with_median: "helper functions/replace_outliers_with_median.R"
+  
+  MEGA_w_HMDB: "../data/TMIC MEGA data template with HMDB IDs.xlsx"
+  HMDB_pathways: "helper functions/plasma mx enricher/annotation_list_hmdb_all_Sept2018.csv"  
+
+output: 
+  html_document:
+    toc: true
+    theme: cerulean
+    
+---
+
+<style type="text/css">
+.main-container {
+  max-width: 1200px;
+  margin-left: auto;
+  margin-right: auto;
+}
+</style>
+
+***  
+
+## Content
+
+
+Analysis on pretreatment gut microbiome sequencing and metabolomics data on cohort of cancer patients treated with ICI
+
+
+
+***  
+
+
+```{r, echo=FALSE, results='hide',message=FALSE}
+
+require(tidyverse)
+require(readxl)
+require(ggplot2)
+require(RColorBrewer)
+require(vegan)
+require(ape)
+require(tidyverse)
+require(ggpubr)
+require(cowplot)
+require(randomForest)
+require(ROCR)
+require(gtsummary)
+require(flextable)
+require(gridExtra)
+library(ggpubr)
+require(reshape2)
+require(dplyr)
+require(openxlsx)
+require(knitr)
+#library(devtools)
+#install_github("jokergoo/ComplexHeatmap")
+require(ComplexHeatmap)
+require(circlize)
+require(mlbench)
+require(caret)
+#BiocManager::install("ropls")
+require(ropls)
+require(GUniFrac)
+require(GenericML)
+library(dplyr)
+library(tibble)
+library(ggrepel)
+require(vegan)
+require(outliers)
+
+
+source(params$read_MannWhitney_fun)
+source(params$read_boxplot_fun)
+source(params$replace_outliers_with_median)
+
+source("helper functions/zicoseq_volcano_plot.R")
+source("helper functions/zicoseq_heatmap_old_colors.R")
+source("helper functions/plasma mx enricher/enricher_function.R")
+
+
+```
+
+
+Run rmarkdown file to load the metadata
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+rmarkdown::render("1_ICI_cohort_description.Rmd")
+
+rownames(clin_meta) <- clin_meta$SampleID
+
+clin_meta_mx <- clin_meta[!is.na(clin_meta$Stool_metabolomics_SampleID),]
+rownames(clin_meta_mx) <- clin_meta_mx$SubjectID
+
+
+```
+
+
+Load metabolomics data
+
+```{r, echo=FALSE, results='hide',message=FALSE}
+
+filename <- "../data/Supplementary Table 1.xlsx"
+#getSheetNames(filename)
+mx_data <- as.data.frame(read.xlsx(filename, sheet = "stool_mx", rowNames = T))
+
+
+```
+
+Add pathway level; remove lipids
+
+```{r, echo=FALSE, results='hide',message=FALSE}
+
+#Get compound classes for pathway enrichment / filtering
+HMDB_pathways <- as.data.frame(read.csv(params$HMDB_pathways))
+head(HMDB_pathways)
+rownames(HMDB_pathways) <- HMDB_pathways$hmdb_id
+
+MEGA_w_HMDB <- as.data.frame(read.xlsx(params$MEGA_w_HMDB, sheet=1, rowNames = F))
+MEGA_w_HMDB$metabolite.name <- gsub(" ", "\\.", MEGA_w_HMDB$metabolite.name)
+
+table(MEGA_w_HMDB$HMDB.IDs %in% HMDB_pathways$hmdb_id) #matching by ID is better
+
+#match 
+table(rownames(mx_data) %in% MEGA_w_HMDB$metabolite.name)
+#FALSE  TRUE 
+#    7   556  
+
+metabolite_names_for_matching <- rownames(mx_data)
+metabolite_hmdb_for_matching <- as.character(sapply(metabolite_names_for_matching, function(x) MEGA_w_HMDB$HMDB.IDs[MEGA_w_HMDB$metabolite.name == x]))
+
+#add the pathways to here
+HMDB_pathways_matched <- HMDB_pathways[metabolite_hmdb_for_matching,]
+#cbind(HMDB_pathways_matched$name, metabolite_names_for_matching)
+
+rownames(HMDB_pathways_matched) <- metabolite_names_for_matching
+HMDB_pathways_matched["Orotic.acid",]
+
+dim(mx_data); dim(HMDB_pathways_matched)
+#[1] 563 167
+#[1] 563  12
+
+```
+
+
+Filtering metabolites based on annotation / pathway
+
+```{r, echo=FALSE, results='hide',message=FALSE}
+
+#head(HMDB_pathways_matched)
+#write.csv(HMDB_pathways_matched, "HMDB_pathways_matched.csv")
+
+#remove metabolites taxonomy_class NA
+#optionally also remove taxonomy_subclass Fatty acid esters, Glycerophosphocholines, Phosphosphingolipids, Triradylcglycerols
+
+#table(HMDB_pathways_matched$taxonomy_class)
+
+HMDB_pathways_matched_sub <- HMDB_pathways_matched[!is.na(HMDB_pathways_matched$taxonomy_class),]
+dim(HMDB_pathways_matched_sub)
+#225  12
+
+mx_data_sub <- mx_data[rownames(HMDB_pathways_matched_sub), ]
+
+
+```
+
+
+Subset and process metabolomics data
+
+```{r, echo=FALSE, results='hide',message=FALSE}
+
+#cbind(rownames(clin_meta_mx), rownames(mx_data))
+
+#impute 0s
+#filter - prevalence > 70%, average intensity > 1e-5; 
+#imputation - half minimum; 
+#normalization - Probabilistic Quotient Normalization (PQN); 
+#transformation - logarithmic
+
+
+#use the concentrations for beta diversity
+#use this for the stats
+#mtbs <- mx_data
+mtbs <- mx_data_sub
+dim(mtbs) 
+
+# Filtering
+hist(colMeans(mtbs != 0))
+mtbs <- mtbs[rowMeans(mtbs != 0) > 0.5, ]
+mtbs <- mtbs[rowMeans(mtbs) > 1e-5, ] #remove metabolites with very low abundance
+dim(mtbs) #186 167
+hist(colMeans(mtbs != 0))
+
+# Imputation
+mtbs <- t(apply(mtbs, 1, function (x) {x[x == 0] <- 0.5 * min(x[x != 0]); return(x)}))
+mtbs_imp <- mtbs
+
+# PQN Normalization
+hist(colSums(mtbs))
+ref <- apply(mtbs, 1, median)
+sf <- apply(mtbs / ref, 1, median)
+mtbs <- t(t(mtbs) / sf)
+
+# log transformation
+mtbs <- log2(mtbs)
+
+hist(mtbs[sample(rownames(mtbs), 1), ])
+
+#rownames(mtbs)
+dim(mtbs)
+#186 167
+
+
+HMDB_pathways_matched_mtbs <- HMDB_pathways_matched_sub[rownames(mtbs), ]
+
+
+```
+
+Subset metabolomics data with clin data and put in same order
+
+```{r, echo=FALSE, results='hide',message=FALSE}
+
+#clin_meta_mx$water_content_perc
+#cbind(rownames(clin_meta_mx), colnames(mx_data))
+
+
+dim(clin_meta_mx); dim(mtbs)
+#[1] 167 58
+#[1] 186 167 
+
+table(clin_meta_mx$IMDC)
+#   0   1 
+#  153  14
+
+table(clin_meta_mx$hepatitis)
+#  0   1 
+# 153  14 
+
+table(clin_meta_mx$pneumonitis)
+#  0   1 
+# 159   8 
+
+table(clin_meta_mx$any_toxicity) 
+#  0  1 
+#  76 91 
+
+
+```
+
+
+```{r, echo=FALSE, results='hide',message=FALSE}
+
+
+#Bristol_score_curated added below
+variables <- c("IMDC", "hepatitis", "pneumonitis","other_irAE", "Sex", "Elixhauser_elix.sum", "Age", "abx_last_month", "BMI",
+               "Bristol_score_imputed")
+
+
+#run on all data, not the subsetted data
+beta_div <- as.matrix(vegdist(t(mx_data), method = "manhattan"))
+
+
+set.seed(1)
+# Permanova - Distance based multivariate analysis of variance
+uni_1a <- adonis2(beta_div ~ IMDC, data = clin_meta_mx, permutations = 999)
+uni_1b <- adonis2(beta_div ~ hepatitis, data = clin_meta_mx, permutations = 999)
+uni_1c <- adonis2(beta_div ~ pneumonitis, data = clin_meta_mx, permutations = 999)
+uni_3 <- adonis2(beta_div ~ other_irAE, data = clin_meta_mx, permutations = 999)
+uni_6 <- adonis2(beta_div ~ Sex, data = clin_meta_mx, permutations = 999)
+uni_7 <- adonis2(beta_div ~ Elixhauser_elix.sum, data = clin_meta_mx, permutations = 999)
+uni_8 <- adonis2(beta_div ~ Age, data = clin_meta_mx, permutations = 999)
+uni_9 <- adonis2(beta_div ~ abx_last_month, data = clin_meta_mx, permutations = 999)
+uni_10 <- adonis2(beta_div ~ BMI, data = clin_meta_mx, permutations = 999)
+uni_11 <- adonis2(beta_div ~ Bristol_score_imputed, data = clin_meta_mx, permutations = 999)
+
+
+beta_res_list <- list(uni_1a, uni_1b, uni_1c, uni_3, uni_6, uni_7, uni_8, uni_9, uni_10, uni_11)
+
+R2_vals <- unlist(lapply(beta_res_list, function(x) x[,"R2"][1]))
+p_vals <- unlist(lapply(beta_res_list, function(x) x[,"Pr(>F)"][1]))
+beta_res_df <- as.data.frame(cbind(R2_vals, p_vals))
+
+rownames(beta_res_df) <- variables
+
+beta_res_df <- beta_res_df[order(beta_res_df$R2_vals, decreasing = F),]
+
+
+#varying color for p values
+#n of group size
+par(mar=c(4,14,1,1))
+barplot(beta_res_df$R2_vals, horiz = T, las=1, col = beta_res_df$p_vals < 0.05, names.arg = rownames(beta_res_df))
+mtext("R2 % variance explained", line=2.5, side=1)
+
+
+filename <- "../figures/barplot fecal mx weighted manhattan.png"
+png(filename, width = 8*330, height = 5*330, res = 330)
+par(mar=c(4,14,1,1))
+barplot(beta_res_df$R2_vals, horiz = T, las=1, col = beta_res_df$p_vals < 0.05, names.arg = rownames(beta_res_df))
+mtext("R2 % variance explained", line=2.5, side=1)
+dev.off()
+
+
+write.csv(beta_res_df, file = "../data/beta_res_df manhattan stool metabolome.csv")
+
+```
+
+
+Correct for water content in figure for paper
+
+```{r, echo=FALSE, results='hide',message=FALSE}
+
+
+#looks the same on all and subsetted by prevalence data
+#beta_div <- as.matrix(vegdist(t(mx_data), method = "manhattan"))
+beta_div <- as.matrix(vegdist(t(mx_data), method = "manhattan"))
+
+#variables <- c("IMDC", "hepatitis", "pneumonitis",
+#               "other_irAE", "any_toxicity", "treatment_success_nr_imputed", 
+#               "Sex", "Elixhauser_elix.sum", "Age", "abx_last_month", "Bristol_score_curated", "BMI")
+
+set.seed(1)
+# Permanova - Distance based multivariate analysis of variance
+uni_1a <- GUniFrac::adonis3(beta_div ~ Bristol_score_imputed + Age + IMDC, data = clin_meta_mx, permutations = 999)$aov.tab
+uni_1b <- GUniFrac::adonis3(beta_div ~ Bristol_score_imputed + Age + hepatitis, data = clin_meta_mx, permutations = 999)$aov.tab
+uni_1c <- GUniFrac::adonis3(beta_div ~ Bristol_score_imputed + Age + pneumonitis, data = clin_meta_mx, permutations = 999)$aov.tab
+uni_1d <- GUniFrac::adonis3(beta_div ~ Bristol_score_imputed + Age + other_irAE, data = clin_meta_mx, permutations = 999)$aov.tab
+
+uni_4 <- GUniFrac::adonis3(beta_div ~ Bristol_score_imputed + Age + Sex, data = clin_meta_mx, permutations = 999)$aov.tab
+uni_5 <- GUniFrac::adonis3(beta_div ~ Bristol_score_imputed + Age + Elixhauser_elix.sum, data = clin_meta_mx, permutations = 999)$aov.tab
+uni_7 <- GUniFrac::adonis3(beta_div ~ Bristol_score_imputed + Age + abx_last_month, data = clin_meta_mx, permutations = 999)$aov.tab
+uni_9 <- GUniFrac::adonis3(beta_div ~ Bristol_score_imputed + Age + BMI, data = clin_meta_mx, permutations = 999)$aov.tab
+
+beta_res_list <- list(uni_1a, uni_1b, uni_1c, uni_1d, uni_4, uni_5, uni_7, uni_9)
+
+R2_vals <- unlist(lapply(beta_res_list, function(x) x[,"R2"][3]))
+p_vals <- unlist(lapply(beta_res_list, function(x) x[,"Pr(>F)"][3]))
+beta_res_df <- as.data.frame(cbind(R2_vals, p_vals))
+rownames(beta_res_df) <- as.character(lapply(beta_res_list, function(x) rownames(x)[3]))
+
+beta_res_df <- beta_res_df[order(beta_res_df$R2_vals, decreasing = F),]
+
+
+#varying color for p values
+#n of group size
+par(mar=c(4,14,1,1))
+barplot(beta_res_df$R2_vals, horiz = T, las=1, col = beta_res_df$p_vals < 0.05, names.arg = rownames(beta_res_df))
+mtext("R2 % variance explained", line=2.5, side=1)
+
+
+#filename <- "../figures/barplot fecal mx weighted manhattan manuscript.png"
+#png(filename, width = 8*330, height = 5*330, res = 330)
+#par(mar=c(4,14,1,1))
+#barplot(beta_res_df$R2_vals, horiz = T, las=1, col = beta_res_df$p_vals < 0.05, names.arg = rownames(beta_res_df))
+#mtext("R2 % variance explained", line=2.5, side=1)
+#dev.off()
+
+
+#write.csv(beta_res_df, file = "../data/beta_res manhattan stool metabolome cor for Age and Bristol Score.csv")
+
+
+```
+
+
+Adjust for more variables, BMI
+
+```{r, echo=FALSE, results='hide',message=FALSE}
+
+#looks the same on all and subsetted by prevalence data
+beta_div <- as.matrix(vegdist(t(mx_data), method = "manhattan"))
+
+
+set.seed(1)
+# Permanova - Distance based multivariate analysis of variance
+uni_1a <- GUniFrac::adonis3(beta_div ~ Bristol_score_imputed + Age + IMDC, data = clin_meta_mx, permutations = 999)$aov.tab
+uni_1b <- GUniFrac::adonis3(beta_div ~ Bristol_score_imputed + Age + hepatitis, data = clin_meta_mx, permutations = 999)$aov.tab
+uni_1c <- GUniFrac::adonis3(beta_div ~ Bristol_score_imputed + Age + pneumonitis, data = clin_meta_mx, permutations = 999)$aov.tab
+uni_1d <- GUniFrac::adonis3(beta_div ~ Bristol_score_imputed + Age + other_irAE, data = clin_meta_mx, permutations = 999)$aov.tab
+
+beta_res_list <- list(uni_1a, uni_1b, uni_1c, uni_1d)
+
+R2_vals <- unlist(lapply(beta_res_list, function(x) x[,"R2"][3]))
+p_vals <- unlist(lapply(beta_res_list, function(x) x[,"Pr(>F)"][3]))
+beta_res_df <- as.data.frame(cbind(R2_vals, p_vals))
+rownames(beta_res_df) <- as.character(lapply(beta_res_list, function(x) rownames(x)[3]))
+
+beta_res_df <- beta_res_df[order(beta_res_df$R2_vals, decreasing = F),]
+
+#varying color for p values
+#n of group size
+par(mar=c(4,14,1,1))
+barplot(beta_res_df$R2_vals, horiz = T, las=1, col = beta_res_df$p_vals < 0.05, names.arg = rownames(beta_res_df))
+mtext("R2 % variance explained", line=2.5, side=1)
+
+write.csv(beta_res_df, file = "../data/beta_res_df_adj manhattan stool metabolome cor Bristol_score_imputed Age.csv")
+
+
+
+```
+
+
+Look at correlation between water content and Bristol stool form scale (BSFS)
+
+```{r, echo=FALSE, results='hide',message=FALSE}
+
+water_content_vec_sub <- clin_meta_mx$water_content_perc
+summary(water_content_vec_sub)
+summary(as.numeric(clin_meta_mx$Bristol_score_curated))
+
+cor(water_content_vec_sub, as.numeric(clin_meta_mx$Bristol_score_curated), use="na.or.complete", method = "spearman")
+cor.test(water_content_vec_sub, as.numeric(clin_meta_mx$Bristol_score_curated), use="na.or.complete", method = "spearman")
+
+#very significantly correlated as expected
+
+#	Spearman's rank correlation rho
+#data:  water_content_vec_sub and as.numeric(clin_meta_mx$Bristol_score_curated)
+#S = 353462, p-value = 8.069e-09
+#alternative hypothesis: true rho is not equal to 0
+#sample estimates:
+#      rho 
+#0.4413515 
+
+
+plot(water_content_vec_sub, as.numeric(clin_meta_mx$Bristol_score_curated), pch=16, las=1, 
+     xlab="water content %", ylab="Bristol Stool Form Scale")
+
+
+```
+
+
+Function to replace outliers with median, on dataframe
+
+```{r, echo=FALSE, results='hide',message=FALSE}
+
+replace_outliers_with_median <- function(df, groups, n_sd=4, verbose=FALSE) {
+  #metabolites assumed to be in rows, groups in columns
+  
+  #get the medians per group per metabolite
+  median_values <- list()
+  df_output <- df
+  for (i in 1:nrow(df)) {
+  x <- as.numeric(df[i,])
+  median_values[[i]] <- aggregate(x[!is.na(x)], by=list(groups[!is.na(x)]), FUN=median)
+  outlier_index <- which((x - mean(x)) / sd(x) > n_sd)
+  if (length(outlier_index) > 0) {
+    if  (verbose==FALSE) {
+    cat("number of removed outliers out of:\n")
+    print(length(outlier_index))
+    print(length(x))
+    }
+    for (j in 1:length(outlier_index)) {
+      na_group <- groups[outlier_index[j]]
+      group_index <- which(groups == na_group)
+      replace_val <- median_values[[i]]$x[median_values[[i]]$Group.1 == na_group]
+      df_output[i,outlier_index[j]] <- replace_val
+    }
+  }
+  }
+  return(df_output)
+}
+
+```
+
+
+Relevel 
+
+```{r, echo=FALSE, results='hide',message=FALSE}
+
+clin_meta_mx$IMDC <- relevel(factor(clin_meta_mx$IMDC), ref = "1")
+clin_meta_mx$hepatitis <- relevel(factor(clin_meta_mx$hepatitis), ref = "1")
+clin_meta_mx$pneumonitis <- relevel(factor(clin_meta_mx$pneumonitis), ref = "1")
+clin_meta_mx$other_irAE <- relevel(factor(clin_meta_mx$other_irAE), ref = "1")
+
+```
+
+
+IMDC t.test and linear model corrected for Bristol_score_imputed and Age on normalized data
+
+```{r, echo=FALSE, results='hide',message=FALSE}
+
+
+mtbs_IMDC <- replace_outliers_with_median(mtbs, clin_meta_mx$IMDC, verbose = T)
+mtbs_imp_IMDC <- replace_outliers_with_median(mtbs_imp, clin_meta_mx$IMDC, verbose = T)
+
+
+p_list <- list()
+lm_p_list <- list()
+fc_list <- list()
+fc_list2 <- list()
+for (i in 1:nrow(mtbs)) {
+  
+  x <- mtbs_IMDC[i,]
+  
+  temp_test <- t.test(x ~ clin_meta_mx$IMDC)
+  lm_temp_test <- lm(x ~ clin_meta_mx$IMDC + clin_meta_mx$Bristol_score_imputed + clin_meta_mx$Age)
+  lm_temp_test_summary <- summary(lm_temp_test)
+  
+  lm_p_list[[i]] <- as.numeric(lm_temp_test_summary$coefficients[, "Pr(>|t|)"][2])
+  p_list[[i]] <- as.numeric(temp_test$p.value)
+  fc_list[[i]] <- log2(median(mtbs_imp_IMDC[i, clin_meta_mx$IMDC == "1"]) / median(mtbs_imp_IMDC[i, clin_meta_mx$IMDC == "0"]))
+  fc_list2[[i]] <- as.numeric(temp_test$estimate[1] - temp_test$estimate[2])
+  
+}
+
+res_df <- as.data.frame(cbind("t_p" = unlist(p_list), "p" = unlist(lm_p_list), "log2FC" = unlist(fc_list)))
+rownames(res_df) <- rownames(mtbs)
+res_df$q <- p.adjust(res_df$p, method = "fdr") 
+
+res_df_IMDC <- res_df
+
+
+plot(res_df$log2FC, -log10(res_df$t_p), las=2)
+abline(h=c(-log10(0.05)))
+
+plot(res_df$log2FC, -log10(res_df$p), las=2)
+abline(h=c(-log10(0.05)))
+abline(v=c(-1,1))
+
+res_df[order(res_df$p, decreasing = F), ]
+
+res_df_IMDC <- res_df
+
+
+```
+
+
+IMDC Pathway enrichment on p<0.05 
+
+```{r, echo=FALSE, results='hide',message=FALSE}
+
+matched_df <- as.data.frame(HMDB_pathways_matched_mtbs)
+
+sig_df <- res_df_IMDC[which(res_df_IMDC$p < 0.05),]
+names_sig <- rownames(sig_df)
+
+HMDB_pathways_matched_mtbs[rownames(sig_df),]
+
+#taxonomy_class very significant with Diazines 
+enricher_output <- enricher_function(names_sig, level="taxonomy_class", matched_df=matched_df, pvalueCutoff=0.25, qvalueCutoff = 0.25)
+#enricher_output
+
+#subclass looks better 
+enricher_output_IMDC <- enricher_function(names_sig, level="taxonomy_subclass", matched_df=matched_df, pvalueCutoff=0.25, qvalueCutoff = 0.25)
+enricher_output_IMDC
+
+enricher_output_IMDC$res_df
+#q-value 0.004069915 for Pyrimidines and pyrimidine derivatives, p.adjust 0.005412987 as the only category <0.1
+#Cytosine/Orotic.acid/Uracil with Orotic.acid having the largest effect size
+
+
+
+```
+
+
+plot boxplots for the significant metabolites IMDC
+
+```{r, echo=FALSE, results='hide',message=FALSE}
+
+
+res_df_IMDC_sig <- res_df_IMDC[res_df_IMDC$p < 0.05 & abs(res_df_IMDC$log2FC) > 1,]
+sig_metabolites <- rownames(res_df_IMDC_sig)
+
+
+clin_meta_mx$IMDC <- relevel(factor(clin_meta_mx$IMDC), ref = "0")
+groups <- clin_meta_mx$IMDC
+sel_colors <- adjustcolor(c("darkgrey", "#FEB24C"), alpha.f = 0.9)
+
+
+#pdfs for all
+pdf(paste("../figures/", "stool metabolites IMDC", ".pdf", sep=""), width=3, height=4)    
+
+for (i in 1:length(sig_metabolites)) {
+  
+  temp_name <- sig_metabolites[i]
+  x <- as.numeric(mx_data[temp_name,])
+
+  par(mar=(c(2.5,4.5,2,0.2)))
+  boxplot(x ~ groups, varwidth=F, las=1, xlab="", ylab="", ylim=range(x), outline=F, border=sel_colors, 
+          horizontal=F, col="white", names=c("no IMDC", "IMDC"))
+  parusr <- par('usr')
+  scale_temp <- 1.17
+  segments(1, parusr[4]/scale_temp, 2, parusr[4]/scale_temp) 
+  scale_temp <- 1.12
+  
+  temp_p <- res_df_IMDC_sig[temp_name,"p"]
+  
+  text(1.5, parusr[4]/scale_temp, paste("p=", round(temp_p,4), sep=""), cex=0.8, font=1)
+
+  mtext("uMole/gram stool", 2, line=3.5)
+  mtext(temp_name, side=3, line=0, adj=0, cex.main=1, font.main=1)
+  stripchart(x ~ groups, vertical = T, method = "jitter", jitter= 0.25, add = TRUE, pch=16, col=sel_colors, cex=0.8)
+}
+dev.off()
+
+
+```
+
+
+hepatitis t.test and linear model corrected for Bristol_score_imputed and Age on normalized data
+
+```{r, echo=FALSE, results='hide',message=FALSE}
+
+
+mtbs_hepatitis <- replace_outliers_with_median(mtbs, clin_meta_mx$hepatitis, verbose = T)
+mtbs_imp_hepatitis <- replace_outliers_with_median(mtbs_imp, clin_meta_mx$hepatitis, verbose = T)
+
+
+p_list <- list()
+lm_p_list <- list()
+fc_list <- list()
+fc_list2 <- list()
+for (i in 1:nrow(mtbs)) {
+  
+  x <- mtbs_hepatitis[i,]
+  
+  temp_test <- t.test(x ~ clin_meta_mx$hepatitis)
+  lm_temp_test <- lm(x ~ clin_meta_mx$hepatitis + clin_meta_mx$Bristol_score_imputed + clin_meta_mx$Age)
+  lm_temp_test_summary <- summary(lm_temp_test)
+  
+  lm_p_list[[i]] <- as.numeric(lm_temp_test_summary$coefficients[, "Pr(>|t|)"][2])
+  p_list[[i]] <- as.numeric(temp_test$p.value)
+  
+  fc_list[[i]] <- log2(median(mtbs_imp_hepatitis[i, clin_meta_mx$hepatitis == "1"]) / median(mtbs_imp_hepatitis[i, clin_meta_mx$hepatitis == "0"]))
+  fc_list2[[i]] <- as.numeric(temp_test$estimate[1] - temp_test$estimate[2])
+  
+}
+
+res_df <- as.data.frame(cbind("t_p" = unlist(p_list), "p" = unlist(lm_p_list), "log2FC" = unlist(fc_list)))
+rownames(res_df) <- rownames(mtbs)
+res_df$q <- p.adjust(res_df$p, method = "fdr") 
+
+res_df_hepatitis <- res_df
+
+res_df_hepatitis[order(as.numeric(res_df_hepatitis$log2FC)),]
+res_df_hepatitis[order(as.numeric(res_df_hepatitis$p), decreasing = F),]
+res_df_hepatitis[as.numeric(res_df_hepatitis$p) < 0.05,]
+
+
+plot(res_df$log2FC, -log10(res_df$p), las=2)
+abline(h=c(-log10(0.05)))
+abline(v=c(-1,1))
+
+
+```
+
+Hepatitis Pathway enrichment on p<0.05 
+
+```{r, echo=FALSE, results='hide',message=FALSE}
+
+sig_df <- res_df_hepatitis[which(res_df_hepatitis$p < 0.05),]
+names_sig <- rownames(sig_df)
+
+HMDB_pathways_matched_mtbs[rownames(sig_df),]
+
+#taxonomy_class Indoles and derivatives p.adjust 0.0346 with 2 metabolites
+enricher_output <- enricher_function(names_sig, level="taxonomy_class", matched_df=matched_df, pvalueCutoff=0.25, qvalueCutoff = 0.25)
+#enricher_output
+
+#subclass looks better 
+enricher_output_Hepatitis <- enricher_function(names_sig, level="taxonomy_subclass", matched_df=matched_df, pvalueCutoff=0.25, qvalueCutoff = 0.25)
+enricher_output_Hepatitis
+
+enricher_output_Hepatitis$res_df
+#no pathways (taxonomy_subclass) with more than 1 metabolite. enricher_output_Hepatitis$res_df 0.197
+
+
+```
+
+
+plot boxplots for the significant metabolites Hepatitis
+
+```{r, echo=FALSE, results='hide',message=FALSE}
+
+
+res_df_hepatitis_sig <- res_df_hepatitis[res_df_hepatitis$p < 0.05 & abs(res_df_hepatitis$log2FC) > 1,]
+sig_metabolites <- rownames(res_df_hepatitis_sig)
+
+
+clin_meta_mx$hepatitis <- relevel(factor(clin_meta_mx$hepatitis), ref = "0")
+groups <- clin_meta_mx$hepatitis
+sel_colors <- adjustcolor(c("darkgrey", "#FEB24C"), alpha.f = 0.9)
+
+
+#pdfs for all
+pdf(paste("../figures/", "stool metabolites hepatitis", ".pdf", sep=""), width=3, height=4)    
+
+for (i in 1:length(sig_metabolites)) {
+  
+  temp_name <- sig_metabolites[i]
+  x <- as.numeric(mx_data[temp_name,])
+
+  par(mar=(c(2.5,4.5,2,0.2)))
+  boxplot(x ~ groups, varwidth=F, las=1, xlab="", ylab="", ylim=range(x), outline=F, border=sel_colors, 
+          horizontal=F, col="white", names=c("no hepatitis", "hepatitis"))
+  parusr <- par('usr')
+  scale_temp <- 1.17
+  segments(1, parusr[4]/scale_temp, 2, parusr[4]/scale_temp) 
+  scale_temp <- 1.12
+  
+  temp_p <- res_df_hepatitis_sig[temp_name,"p"]
+  
+  text(1.5, parusr[4]/scale_temp, paste("p=", round(temp_p,4), sep=""), cex=0.8, font=1)
+
+  mtext("uMole/gram stool", 2, line=3.5)
+  mtext(temp_name, side=3, line=0, adj=0, cex.main=1, font.main=1)
+  stripchart(x ~ groups, vertical = T, method = "jitter", jitter= 0.25, add = TRUE, pch=16, col=sel_colors, cex=0.8)
+}
+dev.off()
+
+
+```
+
+
+pneumonitis t.test and linear model corrected for Bristol_score_imputed and Age on normalized data
+
+```{r, echo=FALSE, results='hide',message=FALSE}
+
+mtbs_pneu <- replace_outliers_with_median(mtbs, clin_meta_mx$pneumonitis, verbose = T)
+mtbs_imp_pneu <- replace_outliers_with_median(mtbs_imp, clin_meta_mx$pneumonitis, verbose = T)
+
+
+p_list <- list()
+lm_p_list <- list()
+fc_list <- list()
+fc_list2 <- list()
+for (i in 1:nrow(mtbs)) {
+  x <- as.numeric(mtbs_pneu[i,])
+  temp_test <- t.test(x ~ clin_meta_mx$pneumonitis)
+  lm_temp_test <- lm(x ~ clin_meta_mx$pneumonitis + clin_meta_mx$Bristol_score_imputed + clin_meta_mx$Age)
+  lm_temp_test_summary <- summary(lm_temp_test)
+  
+  lm_p_list[[i]] <- as.numeric(lm_temp_test_summary$coefficients[, "Pr(>|t|)"][2])
+  p_list[[i]] <- as.numeric(temp_test$p.value)
+  fc_list[[i]] <- log2(median(mtbs_imp_pneu[i, clin_meta_mx$pneumonitis == "1"]) / median(mtbs_imp_pneu[i, clin_meta_mx$pneumonitis == "0"]))
+  fc_list2[[i]] <- as.numeric(temp_test$estimate[1] - temp_test$estimate[2])
+  
+}
+
+res_df <- as.data.frame(cbind("t_p" = unlist(p_list), "p" = unlist(lm_p_list), "log2FC" = unlist(fc_list)))
+rownames(res_df) <- rownames(mtbs)
+res_df$q <- p.adjust(res_df$p, method = "fdr") 
+
+res_df_pneumonitis <- res_df
+
+res_df_pneumonitis[order(as.numeric(res_df_pneumonitis$log2FC)),]
+res_df_pneumonitis[order(as.numeric(res_df_pneumonitis$p), decreasing = F),]
+res_df_pneumonitis[as.numeric(res_df_pneumonitis$p) < 0.05,]
+
+
+plot(res_df$log2FC, -log10(res_df$p), las=2)
+abline(h=c(-log10(0.05)))
+abline(v=c(-1,1))
+
+
+```
+
+
+Pneumonitis Pathway enrichment on p<0.05 
+
+```{r, echo=FALSE, results='hide',message=FALSE}
+
+sig_df <- res_df_pneumonitis[which(res_df_pneumonitis$p < 0.05),]
+names_sig <- rownames(sig_df)
+
+HMDB_pathways_matched_mtbs[rownames(sig_df),]
+
+#taxonomy_class nothing
+enricher_output <- enricher_function(names_sig, level="taxonomy_class", matched_df=matched_df, pvalueCutoff=0.25, qvalueCutoff = 0.25)
+enricher_output
+
+#subclass looks better overall
+enricher_output_Pneumonitis <- enricher_function(names_sig, level="taxonomy_subclass", matched_df=matched_df, pvalueCutoff=0.25, qvalueCutoff = 0.25)
+enricher_output_Pneumonitis
+
+
+enricher_output_Pneumonitis$res_df
+#Glycosphingolipids (taxonomy_subclass) with 5 metabolites p.adjust 0.13; so not significant either
+
+
+```
+
+
+plot boxplots for the significant metabolites Pneu
+
+```{r, echo=FALSE, results='hide',message=FALSE}
+
+res_df_pneumonitis_sig <- res_df_pneumonitis[res_df_pneumonitis$p < 0.05 & abs(res_df_pneumonitis$log2FC) > 1,]
+sig_metabolites <- rownames(res_df_pneumonitis_sig)
+
+
+clin_meta_mx$pneumonitis <- relevel(factor(clin_meta_mx$pneumonitis), ref = "0")
+groups <- clin_meta_mx$pneumonitis
+sel_colors <- adjustcolor(c("darkgrey", "#FEB24C"), alpha.f = 0.9)
+
+
+#pdfs for all
+pdf(paste("../figures/", "stool metabolites pneu", ".pdf", sep=""), width=3, height=4)    
+
+for (i in 1:length(sig_metabolites)) {
+  
+  temp_name <- sig_metabolites[i]
+  x <- as.numeric(mx_data[temp_name,])
+
+  par(mar=(c(2.5,4.5,2,0.2)))
+  boxplot(x ~ groups, varwidth=F, las=1, xlab="", ylab="", ylim=range(x), outline=F, border=sel_colors, 
+          horizontal=F, col="white", names=c("no Pneu", "Pneu"))
+  parusr <- par('usr')
+  scale_temp <- 1.17
+  segments(1, parusr[4]/scale_temp, 2, parusr[4]/scale_temp) 
+  scale_temp <- 1.12
+  
+  temp_p <- res_df_pneumonitis_sig[temp_name,"p"]
+  
+  text(1.5, parusr[4]/scale_temp, paste("p=", round(temp_p,4), sep=""), cex=0.8, font=1)
+
+  mtext("uMole/gram stool", 2, line=3.5)
+  mtext(temp_name, side=3, line=0, adj=0, cex.main=1, font.main=1)
+  stripchart(x ~ groups, vertical = T, method = "jitter", jitter= 0.25, add = TRUE, pch=16, col=sel_colors, cex=0.8)
+}
+dev.off()
+
+
+```
+
+
+other_irAE t.test and linear model corrected for Bristol_score_imputed and Age on normalized data
+
+```{r, echo=FALSE, results='hide',message=FALSE}
+
+mtbs_other <- replace_outliers_with_median(mtbs, clin_meta_mx$other_irAE, verbose = T)
+mtbs_imp_other <- replace_outliers_with_median(mtbs_imp, clin_meta_mx$other_irAE, verbose = T)
+
+
+p_list <- list()
+lm_p_list <- list()
+fc_list <- list()
+fc_list2 <- list()
+
+for (i in 1:nrow(mtbs)) {
+  
+  x <- mtbs_other[i,]
+  
+  temp_test <- t.test(x ~ clin_meta_mx$other_irAE)
+  lm_temp_test <- lm(x ~ clin_meta_mx$other_irAE + clin_meta_mx$Bristol_score_imputed + clin_meta_mx$Age)
+  lm_temp_test_summary <- summary(lm_temp_test)
+  
+  lm_p_list[[i]] <- as.numeric(lm_temp_test_summary$coefficients[, "Pr(>|t|)"][2])
+  p_list[[i]] <- as.numeric(temp_test$p.value)
+  fc_list[[i]] <- log2(median(mtbs_imp_other[i, clin_meta_mx$other_irAE == "1"]) / median(mtbs_imp_other[i, clin_meta_mx$other_irAE == "0"]))
+  fc_list2[[i]] <- as.numeric(temp_test$estimate[1] - temp_test$estimate[2])
+}
+
+res_df <- as.data.frame(cbind("t_p" = unlist(p_list), "p" = unlist(lm_p_list), "log2FC" = unlist(fc_list)))
+rownames(res_df) <- rownames(mtbs)
+res_df$q <- p.adjust(res_df$p, method = "fdr") 
+
+res_df_other_irAE <- res_df
+
+res_df_other_irAE[order(as.numeric(res_df_other_irAE$log2FC)),]
+res_df_other_irAE[order(as.numeric(res_df_other_irAE$p), decreasing = F),]
+res_df_other_irAE[as.numeric(res_df_other_irAE$p) < 0.05,]
+
+
+#more significant metabolites but nothing beyond 1 log2(FC)
+plot(res_df$log2FC, -log10(res_df$p), las=2)
+abline(h=c(-log10(0.05)))
+
+
+
+```
+
+
+other_irAE Pathway enrichment on p<0.05 
+
+```{r, echo=FALSE, results='hide',message=FALSE}
+
+sig_df <- res_df_other_irAE[which(res_df_other_irAE$p < 0.05),]
+names_sig <- rownames(sig_df)
+
+HMDB_pathways_matched_mtbs[rownames(sig_df),]
+
+#taxonomy_class nothing
+enricher_output <- enricher_function(names_sig, level="taxonomy_class", matched_df=matched_df, pvalueCutoff=0.25, qvalueCutoff = 0.25)
+enricher_output
+
+#subclass looks better overall
+enricher_output_other_irAE <- enricher_function(names_sig, level="taxonomy_subclass", matched_df=matched_df, pvalueCutoff=0.25, qvalueCutoff = 0.25)
+enricher_output_other_irAE
+
+
+enricher_output_other_irAE$res_df
+#no p.adjust <0.2
+
+
+```
+
+
+Combine the results
+
+```{r, echo=FALSE, message=FALSE}
+
+comb_res_list <- list(res_df_IMDC, res_df_hepatitis, res_df_pneumonitis, res_df_other_irAE)
+names(comb_res_list) <- c("IMDC", "hepatitis", "pneumonitis", "other irAE")
+
+df.p <- as.data.frame(do.call(cbind, lapply(comb_res_list, function(x) x$p)), row.names = rownames(res_df_IMDC))
+df.fc <- as.data.frame(do.call(cbind, lapply(comb_res_list, function(x) x$log2FC)), row.names = rownames(res_df_IMDC))
+
+
+#also combine the enricher_output_other_irAE
+cutoff <- 0.05
+enricher_output_IMDC$res_df[enricher_output_IMDC$res_df$p.adjust < cutoff,]
+#enricher_output_Hepatitis$res_df[enricher_output_Hepatitis$res_df$p.adjust < cutoff,]
+#enricher_output_Pneumonitis$res_df[enricher_output_Pneumonitis$res_df$p.adjust < cutoff,]
+#enricher_output_other_irAE$res_df[enricher_output_other_irAE$res_df$p.adjust < cutoff,]
+
+#                                             ID  Description GeneRatio BgRatio RichFactor
+#Pyrimidines and pyrimidine derivatives      3/18   3/186          1
+#FoldEnrichment   zScore    pvalue    p.adjust      qvalue         geneID                   Count
+#      10.33333 5.320339 0.0007732838 0.005412987 0.004069915 Cytosine/Orotic.acid/Uracil     3
+
+
+```
+
+```{r, echo=FALSE, message=FALSE}
+
+#assign some colors (consistent with the metagenomics code file)
+col <- c(brewer.pal(12,'Set3'),brewer.pal(12,'Paired'),brewer.pal(9,'Set1'),brewer.pal(8,'Set2'))
+#length(col) #41
+
+###### only do one time here; no need to repeat for genus level below
+# Generate 187 unique random colors
+n <- 187
+colors <- character(0)
+
+while (length(colors) < n) {
+  remaining <- n - length(colors)
+  set.seed(8)
+  new_colors <- sprintf("#%06x", sample(0:16777215, remaining, replace = TRUE))
+  colors <- unique(c(colors, new_colors))
+  colors <- colorspace::darken(colors, amount = 0.2)
+}
+colors <- colors[1:n]  # Ensure exact length
+
+```
+
+
+Heatmap of irAE filtered by significance and fold change
+
+```{r, echo=FALSE, message=FALSE}
+
+
+grp.names <- colnames(df.p)
+grp.labels <- colnames(df.p)
+
+#p and fc cutoff
+cutoff <- 0.05; q.cut1 = 0.001; q.cut2=0.01;q.cut3=0.05
+log2FC_cutoff <- 1
+
+#P_sig is simply one where a row contains a number 1 below cutoff
+P.sig <- df.p[rowSums(df.p <= cutoff) >= 1,]
+FC.sig <- df.fc[rowSums(df.p <= cutoff) >= 1,]
+
+#select FC cutoff as well
+FC.sig <- FC.sig[rowSums(abs(FC.sig) >= log2FC_cutoff) >= 1,]
+P.sig <- P.sig[rownames(FC.sig),]
+
+lgd_sig_p = Legend(pch = c("***", "**","*"), type = "points", labels = c("<0.001", "<0.01", "<0.05"), background="white", title = "p")
+
+FC.sig <- as.matrix(t(FC.sig))
+P.sig <- as.matrix(t(P.sig))
+
+
+#table(HMDB_pathways_matched_mtbs[colnames(FC.sig), "taxonomy_subclass"])
+#               Amino acids, peptides, and analogues            Benzoic acids and derivatives Indolyl carboxylic acids and derivatives 
+#                                       3                                        1                                        1 
+#                                   Methoxyphenols           Purines and purine derivatives   Pyrimidines and pyrimidine derivatives 
+#                                       1                                        1                                        2 
+#             Tricarboxylic acids and derivatives              Tryptamines and derivatives 
+#                                       1                                        1 
+
+vec <- HMDB_pathways_matched_mtbs[colnames(FC.sig), "taxonomy_subclass"]
+label <- vec
+vec_test <- !vec %in% names(which(table(vec) > 1))
+label[vec_test] <- "Other"
+
+col <- c("lightgrey", "#9080BA", "#C275DA")
+names(col) <- unique(label)
+
+
+#names, make wider and add names
+ha_combined <- HeatmapAnnotation(
+  Pathway = label,
+  simple_anno_size = unit(0.4, "inch"),
+  annotation_height = unit(2, "inch"),
+  border = F,
+  col = list(Pathway = col),
+  show_legend = T,
+  annotation_legend_param = list(
+    title_gp = gpar(fontsize = 10, fontface = "bold"),  # Legend title size
+    labels_gp = gpar(fontsize = 12)                    # Legend label size
+  )
+)
+
+
+
+test_df <- FC.sig
+test_df["IMDC", label == "Pyrimidines and pyrimidine derivatives"] <- "draw"
+
+
+#replace dot by space in rownames
+colnames(FC.sig) <- gsub("\\.", " ", colnames(FC.sig))
+
+#make the scale even bidirectional
+scale_max <- max(c(abs(min(FC.sig)), max(FC.sig)))
+
+heatmap_full <- Heatmap(FC.sig, name = "log2(fold-change)", 
+        heatmap_legend_param = list(direction = "vertical"),
+        col = colorRamp2(c(-scale_max, 0, scale_max), 
+                           c("#2171B5",'white', "#FEB24C")),
+        column_gap = unit(1, "mm"), 
+        border = TRUE,
+        column_names_rot = 40,
+        
+        top_annotation = ha_combined,
+        
+        cell_fun = function(j, i, x, y, w, h, fill) {
+          if(P.sig[i,j] <= q.cut1) {
+            grid.text("***", x = x, y = y, hjust = 0.5, vjust = 0.7, gp = gpar(fontsize=12))
+          }else if (P.sig[i,j] <= q.cut2) {
+            grid.text("**", x = x, y = y, hjust = 0.5, vjust = 0.7, gp = gpar(fontsize=12))
+          }else if (P.sig[i,j] <= q.cut3) {
+            grid.text("*", x = x, y = y, hjust = 0.5, vjust = 0.7, gp = gpar(fontsize=12))
+          }
+          # Condition to draw an extra box around specific cells, pyrimidine pathway
+          if (test_df[i, j] == "draw") {
+            grid.rect(x = x, y = y, width = w * 0.95, height = h * 0.95,
+              gp = gpar(col = "#C275DA", fill = NA, lwd = 3))  
+          }
+        },         
+        rect_gp = gpar(col= "white"),
+        show_column_names = T, show_row_names = T,
+        show_column_dend = F,
+        show_row_dend = F,
+        cluster_rows = T,
+        cluster_columns = T,
+        column_names_gp = gpar(fontsize = 14),
+        row_names_max_width = max_text_width(rownames(FC.sig), gp = gpar(fontsize = 20))
+) 
+heatmap_full
+
+#packed_legends <- packLegend(lgd_sig_p, lgd_sig_fdr, direction = "vertical")
+packed_legends <- packLegend(lgd_sig_p, direction = "vertical")
+
+heatmap_plot2 <- draw(heatmap_full, padding = unit(c(0.1, 4, 0.1, 0.1), "cm"), annotation_legend_list = list(packed_legends), merge_legend=T) 
+heatmap_plot2
+
+
+filename <- "../figures/mx ICI irAE heatmap log2_above1_w_pathway.png"
+png(filename, width = 10*330, height = 3.5*330, res = 330)
+heatmap_plot2
+dev.off()
+
+
+
+```
+
+
+Plot individual metabolites IMDC
+
+```{r, echo=FALSE, message=FALSE}
+
+res_df_IMDC_sig <- res_df_IMDC[res_df_IMDC$p < 0.05 & abs(res_df_IMDC$log2FC) > 1,]
+sig_metabolites <- rownames(res_df_IMDC_sig)
+
+#"4-Hydroxybenzoic.acid" "Alpha-aminobutyric.acid" "Cytosine" "Indolelactic.acid" "Orotic.acid" "Xanthine"  
+
+clin_meta_mx$IMDC <- relevel(factor(clin_meta_mx$IMDC), ref = "0")
+groups <- clin_meta_mx$IMDC
+sel_colors <- adjustcolor(c("darkgrey", "#FEB24C"), alpha.f = 0.9)
+
+
+
+
+#"4-Hydroxybenzoic.acid"
+x <- as.numeric(mx_data["4-Hydroxybenzoic.acid",])
+range(x)
+
+plotname <- "Hydroxybenzoic.acid manuscript"
+png(paste("../figures/", plotname, ".png", sep=""), width=3*250, height=4*250, res=300)    
+par(mar=(c(2.5,4.5,2,0.2)))
+#manual ylim, all shown
+boxplot(x ~ groups, varwidth=F, las=1, xlab="", ylab="", outline=F, ylim=c(0, 0.1), border=sel_colors, 
+          horizontal=F, col="white", names=c("no IMDC", "IMDC"))
+parusr <- par('usr')
+scale_temp <- 1.13
+segments(1, parusr[4]/scale_temp, 2, parusr[4]/scale_temp) 
+scale_temp <- 1.08
+text(1.5, parusr[4]/scale_temp, paste("p=", round(res_df_IMDC_sig["4-Hydroxybenzoic.acid", "p"],4), sep=""), cex=0.8, font=1)
+
+mtext("uMole/gram stool", 2, line=3.5)
+mtext("4-Hydroxybenzoic acid", side=3, line=0, at=0.25, adj=0, cex.main=1, font.main=1)
+stripchart(x ~ groups, vertical = T, method = "jitter", jitter= 0.25, add = TRUE, pch=16, col=sel_colors, cex=0.8)
+dev.off()
+
+
+
+
+#"Alpha-aminobutyric.acid"
+x <- as.numeric(mx_data["Alpha-aminobutyric.acid",])
+range(x) #0.00338432 23.00000000
+
+plotname <- "Alpha-aminobutyric.acid manuscript"
+png(paste("../figures/", plotname, ".png", sep=""), width=3*250, height=4*250, res=300)    
+par(mar=(c(2.5,4.5,2,0.2)))
+#manual ylim, 1 point in non-IMDC not shown
+boxplot(x ~ groups, varwidth=F, las=1, xlab="", ylab="", outline=F, ylim=c(0,4.75), border=sel_colors, 
+          horizontal=F, col="white", names=c("no IMDC", "IMDC"))
+parusr <- par('usr')
+scale_temp <- 1.13
+segments(1, parusr[4]/scale_temp, 2, parusr[4]/scale_temp) 
+scale_temp <- 1.08
+text(1.5, parusr[4]/scale_temp, paste("p=", round(res_df_IMDC_sig["Alpha-aminobutyric.acid", "p"],4), sep=""), cex=0.8, font=1)
+
+mtext("uMole/gram stool", 2, line=3.5)
+mtext("Alpha-aminobutyric acid", side=3, line=0, at=0.15, adj=0, cex.main=1, font.main=1)
+stripchart(x ~ groups, vertical = T, method = "jitter", jitter= 0.25, add = TRUE, pch=16, col=sel_colors, cex=0.8)
+dev.off()
+
+
+
+
+#Cytosine
+x <- as.numeric(mx_data["Cytosine",])
+range(x) #0.0000000 0.1465088
+
+plotname <- "Cytosine manuscript"
+png(paste("../figures/", plotname, ".png", sep=""), width=3*250, height=4*250, res=300)    
+par(mar=(c(2.5,4.5,2,0.2)))
+boxplot(x ~ groups, varwidth=F, las=1, xlab="", ylab="", ylim=c(0,0.17), outline=F, border=sel_colors, 
+          horizontal=F, col="white", names=c("no IMDC", "IMDC"))
+parusr <- par('usr')
+scale_temp <- 1.17
+segments(1, parusr[4]/scale_temp, 2, parusr[4]/scale_temp) 
+scale_temp <- 1.12
+text(1.5, parusr[4]/scale_temp, paste("p=", round(res_df_IMDC_sig["Cytosine", "p"],4), sep=""), cex=0.8, font=1)
+
+mtext("uMole/gram stool", 2, line=3.5)
+mtext("Cytosine", side=3, line=0, adj=0, cex.main=1, font.main=1)
+stripchart(x ~ groups, vertical = T, method = "jitter", jitter= 0.25, add = TRUE, pch=16, col=sel_colors, cex=0.8)
+dev.off()
+
+
+
+
+#Indolelactic.acid
+x <- as.numeric(mx_data["Indolelactic.acid",])
+range(x) #0.00000000 0.08167742
+
+plotname <- "Indolelactic acid manuscript"
+png(paste("../figures/", plotname, ".png", sep=""), width=3*250, height=4*250, res=300)    
+par(mar=(c(2.5,4.5,2,0.2)))
+#manual ylim, 1 point in non-IMDC not shown
+boxplot(x ~ groups, varwidth=F, las=1, xlab="", ylab="", outline=F, ylim=c(0, 0.06), border=sel_colors, 
+          horizontal=F, col="white", names=c("no IMDC", "IMDC"))
+parusr <- par('usr')
+scale_temp <- 1.13
+segments(1, parusr[4]/scale_temp, 2, parusr[4]/scale_temp) 
+scale_temp <- 1.08
+text(1.5, parusr[4]/scale_temp, paste("p=", round(res_df_IMDC_sig["Indolelactic.acid", "p"],4), sep=""), cex=0.8, font=1)
+
+mtext("uMole/gram stool", 2, line=3.5)
+mtext("Indolelactic acid", side=3, line=0, adj=0, cex.main=1, font.main=1)
+stripchart(x ~ groups, vertical = T, method = "jitter", jitter= 0.25, add = TRUE, pch=16, col=sel_colors, cex=0.8)
+dev.off()
+
+
+
+
+
+#Orotic acid
+x <- as.numeric(mx_data["Orotic.acid",])
+
+#note 1 sample is outside the plot area
+plotname <- "Orotic acid manuscript"
+png(paste("../figures/", plotname, ".png", sep=""), width=3*250, height=4*250, res=300)    
+par(mar=(c(2.5,4.5,2,0.2)))
+#manual ylim, 1 points in non-IMDC not shown
+boxplot(x ~ groups, varwidth=F, las=1, xlab="", ylab="", ylim=c(0,2), outline=F, border=sel_colors, 
+          horizontal=F, col="white", names=c("no IMDC", "IMDC"))
+parusr <- par('usr')
+scale_temp <- 1.17
+segments(1, parusr[4]/scale_temp, 2, parusr[4]/scale_temp) 
+scale_temp <- 1.12
+text(1.5, parusr[4]/scale_temp, paste("p=", round(res_df_IMDC_sig["Orotic.acid", "p"],4), sep=""), cex=0.8, font=1)
+
+mtext("uMole/gram stool", 2, line=3.5)
+mtext("Orotic acid", side=3, line=0, adj=0, cex.main=1, font.main=1)
+stripchart(x ~ groups, vertical = T, method = "jitter", jitter= 0.25, add = TRUE, pch=16, col=sel_colors, cex=0.8)
+dev.off()
+
+
+
+
+#Xanthine
+x <- as.numeric(mx_data["Xanthine",])
+range(x) #0.07064993 10.83350101
+
+plotname <- "Xanthine manuscript"
+png(paste("../figures/", plotname, ".png", sep=""), width=3*250, height=4*250, res=300)    
+par(mar=(c(2.5,4.5,2,0.2)))
+boxplot(x ~ groups, varwidth=F, las=1, xlab="", ylab="", ylim=c(0,11), outline=F, border=sel_colors, 
+          horizontal=F, col="white", names=c("no IMDC", "IMDC"))
+parusr <- par('usr')
+scale_temp <- 1.17
+segments(1, parusr[4]/scale_temp, 2, parusr[4]/scale_temp) 
+scale_temp <- 1.12
+text(1.5, parusr[4]/scale_temp, paste("p=", round(res_df_IMDC_sig["Xanthine", "p"],4), sep=""), cex=0.8, font=1)
+
+mtext("uMole/gram stool", 2, line=3.5)
+mtext("Xanthine", side=3, line=0, adj=0, cex.main=1, font.main=1)
+stripchart(x ~ groups, vertical = T, method = "jitter", jitter= 0.25, add = TRUE, pch=16, col=sel_colors, cex=0.8)
+dev.off()
+
+
+
+
+
+```
+
+
+correlate metabolites with each other
+
+```{r, echo=FALSE, message=FALSE}
+
+library(Hmisc)
+
+res <- rcorr(as.matrix(t(mtbs)))  # mtbs: your metabolites dataframe
+cor_matrix <- res$r
+p_matrix <- res$P
+
+flattenCorrMatrix <- function(cormat, pmat) {
+  ut <- upper.tri(cormat)
+  data.frame(
+    var1 = rownames(cormat)[row(cormat)[ut]],
+    var2 = colnames(cormat)[col(cormat)[ut]],
+    cor  = cormat[ut],
+    p    = pmat[ut]
+  )
+}
+
+cor_long <- flattenCorrMatrix(cor_matrix, p_matrix)
+cor_long <- cor_long[order(abs(cor_long$cor), decreasing = T),]
+
+sig_cor <- subset(cor_long, p < 0.05 & abs(cor) > 0.25)
+sig_cor
+
+sig_cor[sig_cor$var1 == "Orotic.acid" | sig_cor$var2 == "Orotic.acid",]
+
+
+#malic acid’s role is to provide the carbon skeleton (via aspartate) necessary for the de novo synthesis of the pyrimidine ring, which is assembled into orotic acid before being converted into nucleotides
+
+#would increasing Malate production capacity increase orotic acid?
+plot(mtbs["Orotic.acid",], mtbs["Malic.acid",]) #interesting but not amazing
+plot(mtbs["Orotic.acid",], mtbs["Xanthine",])
+plot(mtbs["Orotic.acid",], mtbs["Dimethylamine",])
+
+
+sig_cor[sig_cor$var1 == "Butyric.acid" | sig_cor$var2 == "Butyric.acid",]
+
+
+```
+
+
+Correlate LBP with metabolome results
+
+```{r, echo=FALSE, message=FALSE}
+
+
+comb_list <- list(mtbs)
+lapply(comb_list, dim)
+
+x <- as.numeric(clin_meta_mx$LBP_conc_ng_ml)
+cor_res_list <- vector(mode = "list", length = length(comb_list))
+for (k in 1:length(comb_list)) {
+  y_data_sub <- comb_list[[k]]
+  cor_list <- vector(mode = "list", length = nrow(y_data_sub))
+  for (i in 1:nrow(y_data_sub)) {
+    y <- as.numeric(y_data_sub[i,])
+    cor_list[[i]][1] <- cor(x, y, use="na.or.complete", method="spearman") #there might be NAs in the data
+    cor_list[[i]][2] <- suppressWarnings(cor.test(x, y, use="na.or.complete", method="spearman")$p.value)
+  }
+  cor_df <- as.data.frame(do.call(rbind, cor_list), stringsAsFactors=F)
+  names(cor_df) <- c("cor", "p.val")
+  rownames(cor_df) <- rownames(y_data_sub)
+  #omit NAs
+  cor_df <- cor_df[!is.na(cor_df$cor),]
+  cor_df$fdr <- p.adjust(cor_df$p.val, "fdr")
+  cor_df <- cor_df[order(abs(cor_df$cor), decreasing = T),]
+  cor_res_list[[k]] <- cor_df
+}
+
+lapply(cor_res_list, dim)
+
+head(cor_res_list[[1]], 20)
+
+
+```

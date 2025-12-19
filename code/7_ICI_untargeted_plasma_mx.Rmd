@@ -1,0 +1,1033 @@
+---
+title: "ICI_plasma_analysis"
+author: "Ruben Mars"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+
+output: 
+  html_document:
+    toc: true
+    theme: cerulean
+    
+---
+
+<style type="text/css">
+.main-container {
+  max-width: 1200px;
+  margin-left: auto;
+  margin-right: auto;
+}
+</style>
+
+***  
+
+
+***  
+
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+require(GUniFrac)
+require(openxlsx)
+require(tidyverse)
+require(phyloseq)
+require(data.table)
+require(vegan)
+require(preprocessCore)
+
+#for pathway enrichment
+require(clusterProfiler)
+require(pheatmap)
+require(DOSE)
+require(enrichplot)
+require(ggupset)
+
+
+
+source("helper functions/zicoseq_volcano_plot.R")
+source("helper functions/zicoseq_heatmap_old_colors.R")
+source("helper functions/MannWhitney_function.R")
+source("helper functions/plasma mx enricher/enricher_function.R")
+
+
+```
+
+Run rmarkdown file to load the metadata
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+
+rmarkdown::render("1_ICI_cohort_description.Rmd")
+
+
+```
+
+Loading and processing the data
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+filename <- "../data/Supplementary Table 1.xlsx"
+getSheetNames(filename)
+#[1] "Positive_counts_imputed" "Positive_counts"         "Positive_annotations"    "Negative_counts_imputed"
+#[5] "Negative_counts"         "Negative_annotations"    "clin_meta_ms"  
+
+clin_meta_untargeted <- clin_meta[!is.na(clin_meta$SampleID_untargeted_LCMS),]
+
+plasma_df_data_pos <- read.xlsx(filename, sheet="Positive_counts_imputed", rowNames = T)
+plasma_df_ann_pos <- read.xlsx(filename, sheet="Positive_annotations", rowNames = T)
+
+plasma_df_data_neg <- read.xlsx(filename, sheet="Negative_counts_imputed", rowNames = T)
+plasma_df_ann_neg <- read.xlsx(filename, sheet="Negative_annotations", rowNames = T)
+
+#checked
+#cbind(rownames(clin_meta_untargeted), colnames(plasma_df_data_pos))
+
+
+#create a metabolite feature name with rownames and the firstname
+plasma_df_ann_neg$feature_name <- paste(plasma_df_ann_neg$row.ID, plasma_df_ann_neg$first_name, sep=";  ")
+plasma_df_ann_pos$feature_name <- paste(plasma_df_ann_pos$row.ID, plasma_df_ann_pos$first_name, sep=";  ")
+
+plasma_df_ann_pos$first_HMDBid <- as.character(sapply(plasma_df_ann_pos$hmdb_ids, function(x) strsplit(x, ";")[[1]][1]))
+plasma_df_ann_neg$first_HMDBid <- as.character(sapply(plasma_df_ann_neg$hmdb_ids, function(x) strsplit(x, ";")[[1]][1]))
+
+#make a new name option column
+plasma_df_ann_pos$comb_names <- paste0(plasma_df_ann_pos$row.ID, ";  MW=", round(plasma_df_ann_pos$row.m.z, digits = 3), ";  rt=", 
+                                       round(plasma_df_ann_pos$row.retention.time, digits = 3))
+plasma_df_ann_neg$comb_names <- paste0(plasma_df_ann_neg$row.ID, ";  MW=", round(plasma_df_ann_neg$row.m.z, digits = 3), ";  rt=", 
+                                       round(plasma_df_ann_neg$row.retention.time, digits = 3))
+
+table(clin_meta_untargeted$other_irAE) 
+# 0  1 
+#89 56 
+
+```
+
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+
+#collapse by correlation.group.ID?
+tail(sort(table(plasma_df_ann_pos$correlation.group.ID)), 50)
+#265 is a huge group, inspect putative annotations
+
+#sort(table(plasma_df_ann_pos$main_annotated_pathway[which(plasma_df_ann_pos$correlation.group.ID == 265)])) #mostly lipids
+#sort(table(plasma_df_ann_pos$main_annotated_pathway[which(plasma_df_ann_pos$correlation.group.ID == 52)])) #mostly amino acid & analogues
+#sort(table(plasma_df_ann_pos$main_annotated_pathway[which(plasma_df_ann_pos$correlation.group.ID == 227)])) #mostly amino acid & analogues
+#sort(table(plasma_df_ann_pos$main_annotated_pathway[which(plasma_df_ann_pos$correlation.group.ID == 82)])) #mostly amino acid & analogues
+
+```
+
+log10 transform and quantile normalize first
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+plasma_df_data_sub_pos_renamed <- as.data.frame(preprocessCore::normalize.quantiles(as.matrix(log10(plasma_df_data_pos))))
+plasma_df_data_sub_neg_renamed <- as.data.frame(preprocessCore::normalize.quantiles(as.matrix(log10(plasma_df_data_neg))))
+
+rownames(plasma_df_data_sub_pos_renamed) <- rownames(plasma_df_data_pos)
+rownames(plasma_df_data_sub_neg_renamed) <- rownames(plasma_df_data_neg)
+
+colnames(plasma_df_data_sub_pos_renamed) <- clin_meta_untargeted$SampleID_untargeted_LCMS
+colnames(plasma_df_data_sub_neg_renamed) <- clin_meta_untargeted$SampleID_untargeted_LCMS
+
+#checked if pos and neg metadata is the same; yes they are 
+
+hist(as.numeric(plasma_df_data_sub_pos_renamed[1,]))
+hist(as.numeric(plasma_df_data_pos[1,]))
+
+hist(as.numeric(plasma_df_data_sub_neg_renamed[1,]))
+hist(as.numeric(plasma_df_data_neg[1,]))
+
+
+```
+
+Positive mode
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+#head(clin_meta_untargeted)
+#beta_div <- as.matrix(vegdist(t(plasma_df_data_sub_pos_renamed), method = "bray"))
+beta_div <- as.matrix(vegdist(t(plasma_df_data_sub_pos_renamed), method = "manhattan"))
+
+
+set.seed(1)
+# Permanova - Distance based multivariate analysis of variance
+n_perm <- 999
+uni_1a <- GUniFrac::adonis3(beta_div ~ IMDC, data = clin_meta_untargeted, permutations = n_perm)$aov.tab
+uni_1b <- GUniFrac::adonis3(beta_div ~ hepatitis, data = clin_meta_untargeted, permutations = n_perm)$aov.tab
+uni_1c <- GUniFrac::adonis3(beta_div ~ pneumonitis, data = clin_meta_untargeted, permutations = n_perm)$aov.tab
+uni_1d <- GUniFrac::adonis3(beta_div ~ other_irAE, data = clin_meta_untargeted, permutations = 999)$aov.tab
+uni_4 <-  GUniFrac::adonis3(beta_div ~ Sex, data = clin_meta_untargeted, permutations = n_perm)$aov.tab
+uni_5 <-  GUniFrac::adonis3(beta_div ~ Elixhauser_elix.sum, data = clin_meta_untargeted, permutations = n_perm)$aov.tab
+uni_6 <-  GUniFrac::adonis3(beta_div ~ Age, data = clin_meta_untargeted, permutations = n_perm)$aov.tab
+uni_7 <-  GUniFrac::adonis3(beta_div ~ abx_last_month, data = clin_meta_untargeted, permutations = n_perm)$aov.tab
+uni_8 <-  GUniFrac::adonis3(beta_div ~ BMI, data = clin_meta_untargeted, permutations = n_perm)$aov.tab
+
+beta_res_list <- list(uni_1a, uni_1b, uni_1c, uni_1d, uni_4, uni_5, uni_6, uni_7, uni_8)
+
+R2_vals <- unlist(lapply(beta_res_list, function(x) x[,"R2"][1]))
+p_vals <- unlist(lapply(beta_res_list, function(x) x[,"Pr(>F)"][1]))
+beta_res_df <- as.data.frame(cbind(R2_vals, p_vals))
+
+rownames(beta_res_df) <- as.character(lapply(beta_res_list, function(x) rownames(x)[1]))
+
+rownames(beta_res_df)[1:4] <- paste0(rownames(beta_res_df)[1:4], "  n=", as.numeric(apply(clin_meta[,rownames(beta_res_df)[1:4]], 2, table)["1",]))
+
+beta_res_df <- beta_res_df[order(beta_res_df$R2_vals, decreasing = F),]
+
+#varying color for p values
+#n of group size
+par(mar=c(4,14,1,1))
+barplot(beta_res_df$R2_vals, horiz = T, las=1, col = beta_res_df$p_vals < 0.05, names.arg = rownames(beta_res_df))
+mtext("R2 % variance explained", line=2.5, side=1)
+
+
+filename <- "../figures/barplot plasma pos bray manuscript.png"
+png(filename, width = 6*330, height = 5*330, res = 330)
+par(mar=c(4,14,1,1))
+barplot(beta_res_df$R2_vals, horiz = T, las=1, col = beta_res_df$p_vals < 0.05, names.arg = rownames(beta_res_df))
+mtext("R2 % variance explained", line=2.5, side=1)
+dev.off()
+
+
+write.csv(beta_res_df, file = "../data/beta_res_df bray plasma pos mode.csv")
+write.csv(beta_res_df[c("hepatitis","other_irAE","pneumonitis","IMDC"),], file = "../data/beta_res_df_adj bray plasma pos mode.csv")
+
+
+```
+
+Negative mode
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+
+#head(clin_meta_untargeted)
+#beta_div <- as.matrix(vegdist(t(plasma_df_data_sub_neg_renamed), method = "bray"))
+beta_div <- as.matrix(vegdist(t(plasma_df_data_sub_neg_renamed), method = "manhattan"))
+
+
+set.seed(1)
+# Permanova - Distance based multivariate analysis of variance
+n_perm <- 999
+uni_1a <- GUniFrac::adonis3(beta_div ~ IMDC, data = clin_meta_untargeted, permutations = n_perm)$aov.tab
+uni_1b <- GUniFrac::adonis3(beta_div ~ hepatitis, data = clin_meta_untargeted, permutations = n_perm)$aov.tab
+uni_1c <- GUniFrac::adonis3(beta_div ~ pneumonitis, data = clin_meta_untargeted, permutations = n_perm)$aov.tab
+uni_1d <- GUniFrac::adonis3(beta_div ~ other_irAE, data = clin_meta_untargeted, permutations = 999)$aov.tab
+
+uni_4 <-  GUniFrac::adonis3(beta_div ~ Sex, data = clin_meta_untargeted, permutations = n_perm)$aov.tab
+uni_5 <-  GUniFrac::adonis3(beta_div ~ Elixhauser_elix.sum, data = clin_meta_untargeted, permutations = n_perm)$aov.tab
+uni_6 <-  GUniFrac::adonis3(beta_div ~ Age, data = clin_meta_untargeted, permutations = n_perm)$aov.tab
+uni_7 <-  GUniFrac::adonis3(beta_div ~ abx_last_month, data = clin_meta_untargeted, permutations = n_perm)$aov.tab
+uni_8 <-  GUniFrac::adonis3(beta_div ~ BMI, data = clin_meta_untargeted, permutations = n_perm)$aov.tab
+
+beta_res_list <- list(uni_1a, uni_1b, uni_1c, uni_1d, uni_4, uni_5, uni_6, uni_7, uni_8)
+
+
+R2_vals <- unlist(lapply(beta_res_list, function(x) x[,"R2"][1]))
+p_vals <- unlist(lapply(beta_res_list, function(x) x[,"Pr(>F)"][1]))
+beta_res_df <- as.data.frame(cbind(R2_vals, p_vals))
+
+rownames(beta_res_df) <- as.character(lapply(beta_res_list, function(x) rownames(x)[1]))
+
+rownames(beta_res_df)[1:4] <- paste0(rownames(beta_res_df)[1:4], "  n=", as.numeric(apply(clin_meta[,rownames(beta_res_df)[1:4]], 2, table)["1",]))
+
+beta_res_df <- beta_res_df[order(beta_res_df$R2_vals, decreasing = F),]
+
+#varying color for p values
+#n of group size
+par(mar=c(4,14,1,1))
+barplot(beta_res_df$R2_vals, horiz = T, las=1, col = beta_res_df$p_vals < 0.05, names.arg = rownames(beta_res_df))
+mtext("R2 % variance explained", line=2.5, side=1)
+
+
+filename <- "../figures/barplot plasma neg bray manuscript.png"
+png(filename, width = 6*330, height = 5*330, res = 330)
+par(mar=c(4,14,1,1))
+barplot(beta_res_df$R2_vals, horiz = T, las=1, col = beta_res_df$p_vals < 0.05, names.arg = rownames(beta_res_df))
+mtext("R2 % variance explained", line=2.5, side=1)
+dev.off()
+
+
+write.csv(beta_res_df, file = "../data/beta_res_df bray plasma neg mode.csv")
+
+
+```
+
+Negative mode, also correct for Age
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+set.seed(1)
+# Permanova - Distance based multivariate analysis of variance
+n_perm <- 999
+uni_1a <- GUniFrac::adonis3(beta_div ~ Age + IMDC, data = clin_meta_untargeted, permutations = n_perm)$aov.tab
+uni_1b <- GUniFrac::adonis3(beta_div ~ Age + hepatitis, data = clin_meta_untargeted, permutations = n_perm)$aov.tab
+uni_1c <- GUniFrac::adonis3(beta_div ~ Age + pneumonitis, data = clin_meta_untargeted, permutations = n_perm)$aov.tab
+uni_1d <- GUniFrac::adonis3(beta_div ~ Age + other_irAE, data = clin_meta_untargeted, permutations = 999)$aov.tab
+
+beta_res_list <- list(uni_1a, uni_1b, uni_1c, uni_1d)
+
+R2_vals <- unlist(lapply(beta_res_list, function(x) x[,"R2"][2]))
+p_vals <- unlist(lapply(beta_res_list, function(x) x[,"Pr(>F)"][2]))
+beta_res_df <- as.data.frame(cbind(R2_vals, p_vals))
+
+rownames(beta_res_df) <- as.character(lapply(beta_res_list, function(x) rownames(x)[2]))
+beta_res_df <- beta_res_df[order(beta_res_df$R2_vals, decreasing = F),]
+
+#varying color for p values
+#n of group size
+par(mar=c(4,14,1,1))
+barplot(beta_res_df$R2_vals, horiz = T, las=1, col = beta_res_df$p_vals < 0.05, names.arg = rownames(beta_res_df))
+mtext("R2 % variance explained", line=2.5, side=1)
+
+write.csv(beta_res_df, file = "../data/beta_res_df_adj bray plasma neg mode Age.csv")
+
+
+```
+
+
+zicoseq IMDC negative mode
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+
+data_df <- as.matrix(plasma_df_data_sub_neg_renamed)
+meta <- clin_meta_untargeted
+
+set.seed(42)
+ZicoSeq.obj <- ZicoSeq(meta.dat = meta, feature.dat = data_df, 
+                       grp.name = "IMDC", feature.dat.type = "other", #adj.name removed, add in later
+                       adj.name = c('Age'),
+                       prev.filter = 0.2, mean.abund.filter = 0,  
+                       max.abund.filter = 0.002, min.prop = 0, 
+                       # Winsorization to replace outliers
+                       is.winsor = TRUE, outlier.pct = 0.03, winsor.end = 'top',
+                       # Posterior sampling 
+                       is.post.sample = TRUE, post.sample.no = 25, 
+                       # Use the square-root transformation
+                       link.func = list(function (x) x^0.5), stats.combine.func = max,
+                       # Permutation-based multiple testing correction
+                       perm.no = 99,  strata = NULL,  #99 for testing, 999 for production
+                       # Reference-based multiple stage normalization
+                       ref.pct = 0.5, stage.no = 6, excl.pct = 0.2,
+                       # Family-wise error rate control
+                       is.fwer = TRUE, verbose = TRUE, return.feature.dat = T)
+
+ZicoSeq.obj.mx.IMDC_neg <- ZicoSeq.obj
+res_df_zico_IMDC_neg <- as.data.frame(do.call(cbind, ZicoSeq.obj[c("R2", "p.raw", "p.adj.fdr", "p.adj.fwer")]))
+
+
+grp.name = 'IMDC' # used for extract coefficient
+p.cutoff = 0.25 # design our expected significance level
+top.n = 15 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "adj" #or "adj"
+
+res_df_IMDC_neg <- MannWhitney_function(tax_df = data_df, groups = "IMDC", meta = meta)
+
+output_plot <- zicoseq_volcano_plot(ZicoSeq.obj, grp.name, p.cutoff, top.n, p_value_class, 
+                                    log2FC=res_df_IMDC_neg$log2FC, save_plot = T, plot_name="untargeted mx neg")
+output_plot$output_plot
+
+plasma_df_ann_neg[output_plot$res_df$otu[output_plot$res_df$sig == "sig"],]
+
+
+```
+
+
+zicoseq IMDC positive mode
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+
+data_df <- as.matrix(plasma_df_data_sub_pos_renamed)
+meta <- clin_meta_untargeted
+
+set.seed(42)
+ZicoSeq.obj <- ZicoSeq(meta.dat = meta, feature.dat = data_df, 
+                       grp.name = "IMDC", feature.dat.type = "other", #adj.name removed, add in later
+                       adj.name = c('Age'),
+                       prev.filter = 0.2, mean.abund.filter = 0,  
+                       max.abund.filter = 0.002, min.prop = 0, 
+                       # Winsorization to replace outliers
+                       is.winsor = TRUE, outlier.pct = 0.03, winsor.end = 'top',
+                       # Posterior sampling 
+                       is.post.sample = TRUE, post.sample.no = 25, 
+                       # Use the square-root transformation
+                       link.func = list(function (x) x^0.5), stats.combine.func = max,
+                       # Permutation-based multiple testing correction
+                       perm.no = 99,  strata = NULL,  #99 for testing, 999 for production
+                       # Reference-based multiple stage normalization
+                       ref.pct = 0.5, stage.no = 6, excl.pct = 0.2,
+                       # Family-wise error rate control
+                       is.fwer = TRUE, verbose = TRUE, return.feature.dat = T)
+
+ZicoSeq.obj.mx.IMDC_pos <- ZicoSeq.obj
+res_df_zico_IMDC_pos <- as.data.frame(do.call(cbind, ZicoSeq.obj[c("R2", "p.raw", "p.adj.fdr", "p.adj.fwer")]))
+
+
+
+grp.name = 'IMDC' # used for extract coefficient
+p.cutoff = 0.25 # design our expected significance level
+top.n = 15 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "adj" #or "adj"
+
+res_df_IMDC_pos <- MannWhitney_function(tax_df = data_df, groups = "IMDC", meta = meta)
+
+output_plot <- zicoseq_volcano_plot(ZicoSeq.obj, grp.name, p.cutoff, top.n, p_value_class, 
+                                    log2FC=res_df_IMDC_pos$log2FC, save_plot = T, plot_name="untargeted mx pos")
+output_plot$output_plot
+
+
+```
+
+zicoseq negative mode hepatitis
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+
+data_df <- as.matrix(plasma_df_data_sub_neg_renamed)
+meta <- clin_meta_untargeted
+
+set.seed(42)
+ZicoSeq.obj <- ZicoSeq(meta.dat = meta, feature.dat = data_df, 
+                       grp.name = "hepatitis", feature.dat.type = "other", 
+                       adj.name = c('Age'), 
+                       prev.filter = 0.2, mean.abund.filter = 0,  
+                       #max.abund.filter = 0.002, min.prop = 0, 
+                       # Winsorization to replace outliers
+                       is.winsor = TRUE, outlier.pct = 0.03, winsor.end = 'top',
+                       # Posterior sampling 
+                       is.post.sample = TRUE, post.sample.no = 25, 
+                       # Use the square-root transformation
+                       link.func = list(function (x) x^0.5), stats.combine.func = max,
+                       # Permutation-based multiple testing correction
+                       perm.no = 999,  strata = NULL,  #99 for testing, 999 for production
+                       # Reference-based multiple stage normalization
+                       ref.pct = 0.5, stage.no = 6, excl.pct = 0.2,
+                       # Family-wise error rate control
+                       is.fwer = TRUE, verbose = TRUE, return.feature.dat = T)
+
+ZicoSeq.obj.hepatitis.neg <- ZicoSeq.obj
+zico.obj <- ZicoSeq.obj.hepatitis.neg
+
+grp.name = 'hepatitis' # used for extract coefficient
+p.cutoff = 0.25 # design our expected significance level
+top.n = 8 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "adj" #or "adj"
+
+#get FC
+res_df_liver_neg <- MannWhitney_function(tax_df = data_df, groups = "hepatitis", meta = meta)
+
+output_plot <- zicoseq_volcano_plot(zico.obj, grp.name, p.cutoff, top.n, p_value_class, 
+                                         res_df_liver_neg$log2FC, save_plot=T, plot_name="untargeted mx neg")
+output_plot$output_plot
+
+
+
+```
+
+
+zicoseq positive mode hepatitis
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+
+data_df <- as.matrix(plasma_df_data_sub_pos_renamed)
+meta <- clin_meta_untargeted
+
+set.seed(42)
+ZicoSeq.obj <- ZicoSeq(meta.dat = meta, feature.dat = data_df, 
+                       grp.name = "hepatitis", feature.dat.type = "other",
+                       adj.name = c('Age'), 
+                       prev.filter = 0.2, mean.abund.filter = 0,  
+                       #max.abund.filter = 0.002, min.prop = 0, 
+                       # Winsorization to replace outliers
+                       is.winsor = TRUE, outlier.pct = 0.03, winsor.end = 'top',
+                       # Posterior sampling 
+                       is.post.sample = TRUE, post.sample.no = 25, 
+                       # Use the square-root transformation
+                       link.func = list(function (x) x^0.5), stats.combine.func = max,
+                       # Permutation-based multiple testing correction
+                       perm.no = 999,  strata = NULL,  #99 for testing, 999 for production
+                       # Reference-based multiple stage normalization
+                       ref.pct = 0.5, stage.no = 6, excl.pct = 0.2,
+                       # Family-wise error rate control
+                       is.fwer = TRUE, verbose = TRUE, return.feature.dat = T)
+
+ZicoSeq.obj.hepatitis.pos <- ZicoSeq.obj
+zico.obj <- ZicoSeq.obj.hepatitis.pos
+
+grp.name = 'hepatitis' # used for extract coefficient
+p.cutoff = 0.25 # design our expected significance level
+top.n = 8 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "adj" #or "raw"
+
+#get FC
+res_df_liver_pos <- MannWhitney_function(tax_df = data_df, groups = "hepatitis", meta = meta)
+
+output_plot <- zicoseq_volcano_plot(zico.obj, grp.name, p.cutoff, top.n, p_value_class, 
+                                    res_df_liver_pos$log2FC, save_plot=T, plot_name="untargeted mx pos")
+output_plot$output_plot
+
+
+
+```
+
+zicoseq negative mode pneumonitis
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+data_df <- as.matrix(plasma_df_data_sub_neg_renamed)
+meta <- clin_meta_untargeted
+
+set.seed(42)
+ZicoSeq.obj <- ZicoSeq(meta.dat = meta, feature.dat = data_df, 
+                       grp.name = "pneumonitis", feature.dat.type = "other", 
+                       adj.name = c('Age'),
+                       prev.filter = 0.2, mean.abund.filter = 0,  
+                       #max.abund.filter = 0.002, min.prop = 0, 
+                       # Winsorization to replace outliers
+                       is.winsor = TRUE, outlier.pct = 0.03, winsor.end = 'top',
+                       # Posterior sampling 
+                       is.post.sample = TRUE, post.sample.no = 25, 
+                       # Use the square-root transformation
+                       link.func = list(function (x) x^0.5), stats.combine.func = max,
+                       # Permutation-based multiple testing correction
+                       perm.no = 999,  strata = NULL,  #99 for testing, 999 for production
+                       # Reference-based multiple stage normalization
+                       ref.pct = 0.5, stage.no = 6, excl.pct = 0.2,
+                       # Family-wise error rate control
+                       is.fwer = TRUE, verbose = TRUE, return.feature.dat = T)
+
+ZicoSeq.obj.pneumonitis.neg <- ZicoSeq.obj
+zico.obj <- ZicoSeq.obj.pneumonitis.neg
+
+grp.name = 'pneumonitis' # used for extract coefficient
+p.cutoff = 0.25 # design our expected significance level
+top.n = 8 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "adj" #or "adj"
+
+#get FC
+res_df_pulmonary_neg <- MannWhitney_function(tax_df = data_df, groups = "pneumonitis", meta = meta)
+
+output_plot <- zicoseq_volcano_plot(zico.obj, grp.name, p.cutoff, top.n, p_value_class, 
+                                    res_df_pulmonary_neg$log2FC, save_plot=T, plot_name="untargeted mx neg")
+output_plot$output_plot
+
+
+```
+
+zicoseq positive mode pneumonitis
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+data_df <- as.matrix(plasma_df_data_sub_pos_renamed)
+meta <- clin_meta_untargeted
+
+set.seed(42)
+ZicoSeq.obj <- ZicoSeq(meta.dat = meta, feature.dat = data_df, 
+                       grp.name = "pneumonitis", feature.dat.type = "other",
+                       adj.name = c('Age'),
+                       prev.filter = 0.2, mean.abund.filter = 0,  
+                       #max.abund.filter = 0.002, min.prop = 0, 
+                       # Winsorization to replace outliers
+                       is.winsor = TRUE, outlier.pct = 0.03, winsor.end = 'top',
+                       # Posterior sampling 
+                       is.post.sample = TRUE, post.sample.no = 25, 
+                       # Use the square-root transformation
+                       link.func = list(function (x) x^0.5), stats.combine.func = max,
+                       # Permutation-based multiple testing correction
+                       perm.no = 999,  strata = NULL,  #99 for testing, 999 for production
+                       # Reference-based multiple stage normalization
+                       ref.pct = 0.5, stage.no = 6, excl.pct = 0.2,
+                       # Family-wise error rate control
+                       is.fwer = TRUE, verbose = TRUE, return.feature.dat = T)
+
+ZicoSeq.obj.pneumonitis.pos <- ZicoSeq.obj
+zico.obj <- ZicoSeq.obj.pneumonitis.pos
+
+grp.name = 'pneumonitis' # used for extract coefficient
+p.cutoff = 0.25 # design our expected significance level
+top.n = 8 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "adj" #or "adj"
+
+#get FC
+res_df_pulmonary_pos <- MannWhitney_function(tax_df = data_df, groups = "pneumonitis", meta = meta)
+
+output_plot <- zicoseq_volcano_plot(zico.obj, grp.name, p.cutoff, top.n, p_value_class, 
+                                    res_df_pulmonary_pos$log2FC, save_plot=T, plot_name="untargeted mx pos")
+output_plot$output_plot
+
+
+```
+
+zicoseq negative mode Other irAE
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+data_df <- as.matrix(plasma_df_data_sub_neg_renamed)
+meta <- clin_meta_untargeted
+
+set.seed(42)
+ZicoSeq.obj <- ZicoSeq(meta.dat = meta, feature.dat = data_df, 
+                       grp.name = "other_irAE", feature.dat.type = "other", 
+                       adj.name = c('Age'),
+                       prev.filter = 0.2, mean.abund.filter = 0,  
+                       #max.abund.filter = 0.002, min.prop = 0, 
+                       # Winsorization to replace outliers
+                       is.winsor = TRUE, outlier.pct = 0.03, winsor.end = 'top',
+                       # Posterior sampling 
+                       is.post.sample = TRUE, post.sample.no = 25, 
+                       # Use the square-root transformation
+                       link.func = list(function (x) x^0.5), stats.combine.func = max,
+                       # Permutation-based multiple testing correction
+                       perm.no = 999,  strata = NULL,  #99 for testing, 999 for production
+                       # Reference-based multiple stage normalization
+                       ref.pct = 0.5, stage.no = 6, excl.pct = 0.2,
+                       # Family-wise error rate control
+                       is.fwer = TRUE, verbose = TRUE, return.feature.dat = T)
+
+ZicoSeq.obj.other_irAE.neg <- ZicoSeq.obj
+zico.obj <- ZicoSeq.obj.other_irAE.neg
+
+grp.name = 'other_irAE' # used for extract coefficient
+p.cutoff = 0.25 # design our expected significance level
+top.n = 8 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "adj" #or "adj"
+
+#get FC
+res_df_otherirAE_neg <- MannWhitney_function(tax_df = data_df, groups = "other_irAE", meta = meta)
+
+output_plot <- zicoseq_volcano_plot(zico.obj, grp.name, p.cutoff, top.n, p_value_class, 
+                                    res_df_otherirAE_neg$log2FC, save_plot=T, plot_name="untargeted mx neg")
+output_plot$output_plot
+
+
+```
+
+zicoseq postive mode Other irAE
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+data_df <- as.matrix(plasma_df_data_sub_pos_renamed)
+meta <- clin_meta_untargeted
+
+set.seed(42)
+ZicoSeq.obj <- ZicoSeq(meta.dat = meta, feature.dat = data_df, 
+                       grp.name = "other_irAE", feature.dat.type = "other", 
+                       adj.name = c('Age'),
+                       prev.filter = 0.2, mean.abund.filter = 0,  
+                       #max.abund.filter = 0.002, min.prop = 0, 
+                       # Winsorization to replace outliers
+                       is.winsor = TRUE, outlier.pct = 0.03, winsor.end = 'top',
+                       # Posterior sampling 
+                       is.post.sample = TRUE, post.sample.no = 25, 
+                       # Use the square-root transformation
+                       link.func = list(function (x) x^0.5), stats.combine.func = max,
+                       # Permutation-based multiple testing correction
+                       perm.no = 999,  strata = NULL,  #99 for testing, 999 for production
+                       # Reference-based multiple stage normalization
+                       ref.pct = 0.5, stage.no = 6, excl.pct = 0.2,
+                       # Family-wise error rate control
+                       is.fwer = TRUE, verbose = TRUE, return.feature.dat = T)
+
+ZicoSeq.obj.other_irAE.pos <- ZicoSeq.obj
+zico.obj <- ZicoSeq.obj.other_irAE.pos
+
+grp.name = 'other_irAE' # used for extract coefficient
+p.cutoff = 0.25 # design our expected significance level
+top.n = 8 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "adj" #or "adj"
+
+#get FC
+res_df_otherirAE_pos <- MannWhitney_function(tax_df = data_df, groups = "other_irAE", meta = meta)
+
+output_plot <- zicoseq_volcano_plot(zico.obj, grp.name, p.cutoff, top.n, p_value_class, 
+                                    res_df_otherirAE_pos$log2FC, save_plot=T, plot_name="untargeted mx pos")
+output_plot$output_plot
+
+
+```
+
+irAEs combined heatmap negative mode
+Cannot make irAEs combined heatmap positive mode; no significant changes
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+zico_list <- list(ZicoSeq.obj.mx.IMDC_neg, ZicoSeq.obj.hepatitis.neg, ZicoSeq.obj.pneumonitis.neg, ZicoSeq.obj.other_irAE.neg)
+grp.names <- unlist(lapply(zico_list, function(x) rownames(x$coef.list[[1]])[nrow(x$coef.list[[1]])]))
+grp.labels <- grp.names
+sign_cutoffs <- c(0.2, 0.1, 0.05) #for stars in plots; these cutoffs are used in the manuscript throughout
+p_or_q <- "q" #"q"
+
+#adapt function to accept new colnames (metabolite names)
+new_names_vec <- plasma_df_ann_neg$comb_names
+names(new_names_vec) <- plasma_df_ann_neg$row.ID
+
+
+heatmap_list <- zicoseq_heatmap(zico_list, grp.names, grp.labels, sign_cutoffs, single_cutoff=F, p_or_q, rotate = T, 
+                                column_name_rot = 40, new_names=T, new_names_vec=new_names_vec)
+heatmap_list$heatmap_plot
+
+
+filename <- "../figures/plasma mx neg mzmine ICI heatmap irAEs fdr 0_2.png"
+png(filename, width = 9*330, height = 3.25*330, res = 330)
+heatmap_list$heatmap_plot
+dev.off()
+
+
+#2 ceramides
+plasma_df_ann_neg$row.ID[which(plasma_df_ann_neg$comb_names %in% heatmap_list$sign_names)]
+plasma_df_ann_neg$names[which(plasma_df_ann_neg$comb_names %in% heatmap_list$sign_names)]
+
+
+```
+
+
+Pathway enrichment based on our own annotations
+
+processing Pos
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+#Get compound classes for pathway enrichment 
+HMDB_pathway_filename <- "../data/annotation_list_hmdb_all_Sept2018.csv"  
+
+HMDB_pathways <- as.data.frame(read.csv(HMDB_pathway_filename))
+rownames(HMDB_pathways) <- HMDB_pathways$hmdb_id
+
+#match; check if matching with your data is good
+head(plasma_df_ann_pos,1)
+
+table(plasma_df_ann_pos$first_HMDBid %in% rownames(HMDB_pathways))
+#FALSE  TRUE 
+#3934  2848 
+
+#subset HMDB_pathways for those ids annotated in the data and put in same order
+#there are duplicate annotations
+metabolite_hmdb_for_matching <- unique(plasma_df_ann_pos$first_HMDBid[plasma_df_ann_pos$first_HMDBid %in% rownames(HMDB_pathways)])
+HMDB_pathways_matched <- HMDB_pathways[metabolite_hmdb_for_matching,]
+dim(HMDB_pathways_matched)
+#1653   12
+
+#on one set of significant metabolites
+matched_df <- as.data.frame(HMDB_pathways_matched)
+
+
+#-------------------------------------------------------------------------------
+#negative
+table(plasma_df_ann_neg$first_HMDBid %in% rownames(HMDB_pathways))
+#FALSE  TRUE 
+# 3444  1524 
+
+metabolite_hmdb_for_matching_neg <- unique(plasma_df_ann_neg$first_HMDBid[plasma_df_ann_neg$first_HMDBid %in% rownames(HMDB_pathways)])
+HMDB_pathways_matched_neg <- HMDB_pathways[metabolite_hmdb_for_matching_neg,]
+dim(HMDB_pathways_matched_neg)
+#851   12
+
+#on one set of significant metabolites
+matched_df_neg <- as.data.frame(HMDB_pathways_matched_neg)
+
+
+```
+
+IMDC pos 
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+sig_df <- which(ZicoSeq.obj.mx.IMDC_pos$p.raw < 0.05)
+names_sig <- names(sig_df)
+names_sig <- plasma_df_ann_pos[names_sig, "first_HMDBid"]
+names_sig <- as.character(na.omit(names_sig))
+
+#level indicates different columns in matched_df; taxonomy_class, taxonomy_subclass, pathway_name
+enricher_output <- enricher_function(names_sig, level="taxonomy_subclass", matched_df=matched_df, pvalueCutoff=1, qvalueCutoff = 1)
+enricher_output$res_dotplot
+enricher_output$res_networkplot
+
+enricher_output_IMDC_pos <- enricher_output
+#beware; no cutoff
+
+
+```
+
+IMDC neg
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+
+sig_df <- which(ZicoSeq.obj.mx.IMDC_neg$p.raw < 0.05)
+names_sig <- names(sig_df)
+names_sig <- plasma_df_ann_neg[names_sig, "first_HMDBid"]
+names_sig <- as.character(na.omit(names_sig))
+
+#level indicates different columns in matched_df; taxonomy_class, taxonomy_subclass, pathway_name
+enricher_output <- enricher_function(names_sig, level="taxonomy_subclass", matched_df=matched_df_neg, pvalueCutoff=1, qvalueCutoff = 1)
+enricher_output$res_dotplot
+enricher_output$res_networkplot
+
+enricher_output_IMDC_neg <- enricher_output 
+#beware; no cutoff
+
+
+```
+
+Hepatitis pos
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+#see if there are any results to see if the script works
+sig_df <- which(ZicoSeq.obj.hepatitis.pos$p.raw < 0.05)
+names_sig <- names(sig_df)
+names_sig <- plasma_df_ann_pos[names_sig, "first_HMDBid"]
+names_sig <- as.character(na.omit(names_sig))
+names_sig <- names_sig[names_sig %in% rownames(matched_df)]
+
+#level indicates different columns in matched_df
+enricher_output <- enricher_function(names_sig, level="taxonomy_subclass", matched_df=matched_df, pvalueCutoff=1, qvalueCutoff = 1)
+enricher_output$res_networkplot
+enricher_output$res_dotplot
+
+enricher_output_hepatitis.pos <- enricher_output 
+#beware; no cutoff
+
+
+```
+
+Hepatitis neg
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+#make names_sig BIOME ids
+sig_df <- which(ZicoSeq.obj.hepatitis.neg$p.raw < 0.05)
+names_sig <- names(sig_df)
+names_sig <- plasma_df_ann_neg[names_sig, "first_HMDBid"]
+names_sig <- as.character(na.omit(names_sig))
+
+#level indicates different columns in matched_df; taxonomy_class, taxonomy_subclass, pathway_name
+enricher_output <- enricher_function(names_sig, level="taxonomy_subclass", matched_df=matched_df_neg, pvalueCutoff=1, qvalueCutoff = 1)
+enricher_output$res_dotplot
+enricher_output$res_networkplot
+
+enricher_output_hepatitis.neg <- enricher_output 
+#beware; no cutoff
+
+
+```
+
+Pneumonitis pos
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+#see if there are any results to see if the script works
+
+sig_df <- which(ZicoSeq.obj.pneumonitis.pos$p.raw < 0.05)
+names_sig <- names(sig_df)
+names_sig <- plasma_df_ann_pos[names_sig, "first_HMDBid"]
+names_sig <- as.character(na.omit(names_sig))
+names_sig <- names_sig[names_sig %in% rownames(matched_df)]
+
+#level indicates different columns in matched_df
+enricher_output <- enricher_function(names_sig, level="taxonomy_subclass", matched_df=matched_df, pvalueCutoff=1, qvalueCutoff = 1)
+enricher_output$res_dotplot
+enricher_output$res_networkplot
+
+enricher_output_pneumonitis.pos <- enricher_output 
+#beware; no cutoff
+
+
+```
+
+Pneumonitis neg
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+#make names_sig BIOME ids
+sig_df <- which(ZicoSeq.obj.pneumonitis.neg$p.raw < 0.05)
+names_sig <- names(sig_df)
+names_sig <- plasma_df_ann_neg[names_sig, "first_HMDBid"]
+names_sig <- as.character(na.omit(names_sig))
+
+#level indicates different columns in matched_df; taxonomy_class, taxonomy_subclass, pathway_name
+enricher_output <- enricher_function(names_sig, level="taxonomy_subclass", matched_df=matched_df_neg, pvalueCutoff=1, qvalueCutoff = 1)
+enricher_output$res_dotplot
+enricher_output$res_networkplot
+
+enricher_output_pneumonitis.neg <- enricher_output
+#beware; no cutoff
+
+
+```
+
+other irAE pos
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+#see if there are any results to see if the script works
+
+sig_df <- which(ZicoSeq.obj.other_irAE.pos$p.raw < 0.05)
+names_sig <- names(sig_df)
+names_sig <- plasma_df_ann_pos[names_sig, "first_HMDBid"]
+names_sig <- as.character(na.omit(names_sig))
+names_sig <- names_sig[names_sig %in% rownames(matched_df)]
+
+#level indicates different columns in matched_df
+enricher_output <- enricher_function(names_sig, level="taxonomy_subclass", matched_df=matched_df, pvalueCutoff=1, qvalueCutoff = 1)
+
+enricher_output$res_dotplot
+enricher_output$res_networkplot
+
+enricher_output_otherirAE.pos <- enricher_output 
+#beware; no cutoff
+
+
+```
+
+other irAE neg
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+#make names_sig BIOME ids
+sig_df <- which(ZicoSeq.obj.other_irAE.neg$p.raw < 0.05)
+names_sig <- names(sig_df)
+names_sig <- plasma_df_ann_neg[names_sig, "first_HMDBid"]
+names_sig <- as.character(na.omit(names_sig))
+
+#level indicates different columns in matched_df; taxonomy_class, taxonomy_subclass, pathway_name
+enricher_output <- enricher_function(names_sig, level="taxonomy_subclass", matched_df=matched_df_neg, pvalueCutoff=1, qvalueCutoff = 1)
+enricher_output$res_dotplot
+enricher_output$res_networkplot
+#beware; no cutoff
+
+enricher_output_otherirAE.neg <- enricher_output
+
+```
+
+Combine the results in a heatmap and plot the combined networkplots
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+#need to fill gaps like in the mummichog combinator function, adapt that
+
+#merge into a dataframe and use the general heatmap code to plot it
+
+enricher_list_neg <- list(enricher_output_IMDC_neg, enricher_output_hepatitis.neg,
+                          enricher_output_pneumonitis.neg, enricher_output_otherirAE.neg)
+names(enricher_list_neg) <- c("IMDC", "Hepatitis", "Pneumonitis", "other irAE")
+
+
+enricher_list_pos <- list(enricher_output_IMDC_pos, enricher_output_hepatitis.pos, 
+                          enricher_output_pneumonitis.pos, enricher_output_otherirAE.pos)
+names(enricher_list_pos) <- c("IMDC", "Hepatitis", "Pneumonitis", "other irAE")
+
+
+
+```
+
+
+Merge pathway enrichment results
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+#merge positive mode
+
+grp.names <- names(enricher_list_pos)
+#select only those pathways with p<0.05 later
+res_df_list <- lapply(enricher_list_pos, function(x) x$res_df)
+
+unique_pathways <- unique(unlist(lapply(res_df_list, function(x) rownames(x))))
+
+df = data.frame(matrix(nrow = length(unique_pathways), ncol = length(grp.names))) 
+rownames(df) <- unique_pathways
+#add p-value cutoff used for the features
+colnames(df) <- grp.names
+  
+df[,1:length(grp.names)] <- 1
+p_df <- df
+df[,1:length(grp.names)] <- 0
+n_df <- df
+
+for (i in 1:ncol(df)) {
+  p_df[rownames(res_df_list[[i]]),i] <- res_df_list[[i]]$pvalue
+  n_df[rownames(res_df_list[[i]]),i] <- res_df_list[[i]]$Count
+}
+
+p_df_pos <- p_df
+n_df_pos <- n_df
+
+
+#-----------------------------------
+#merge negative mode
+
+grp.names <- names(enricher_list_neg)
+#select only those pathways with p<0.05
+res_df_list <- lapply(enricher_list_neg, function(x) x$res_df)
+
+unique_pathways <- unique(unlist(lapply(res_df_list, function(x) rownames(x))))
+
+df = data.frame(matrix(nrow = length(unique_pathways), ncol = length(grp.names))) 
+rownames(df) <- unique_pathways
+#add p-value cutoff used for the features
+colnames(df) <- grp.names
+  
+df[,1:length(grp.names)] <- 1
+p_df <- df
+df[,1:length(grp.names)] <- 0
+n_df <- df
+
+for (i in 1:ncol(df)) {
+  p_df[rownames(res_df_list[[i]]),i] <- res_df_list[[i]]$pvalue
+  n_df[rownames(res_df_list[[i]]),i] <- res_df_list[[i]]$Count
+}
+
+p_df_neg <- p_df
+n_df_neg <- n_df
+
+
+
+```
+
+
+Plot these results in heatmap, select using cutoff later
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+source("../../general functions/zicoseq_heatmap_for_enrichment.R")
+
+#combine pos and negative into a single heatmap?
+sign_cutoffs <- c(0.05, 0.01, 0.001)
+
+
+heatmap_plot_pos <- zicoseq_heatmap(n_df_pos, p_df_pos, grp.labels = grp.names, sign_cutoffs = sign_cutoffs, column_name_rot=40, left_margin = 2)
+
+filename <- "../figures/plasma_mx_pathway_enrich_pos.png"
+png(filename, width = 6*330, height = 3.5*330, res = 330)
+heatmap_plot_pos
+dev.off()
+
+
+
+heatmap_plot_neg <- zicoseq_heatmap(n_df_neg, p_df_neg, grp.labels = grp.names, sign_cutoffs = sign_cutoffs, column_name_rot=40, left_margin = 2)
+
+filename <- "../figures/plasma_mx_pathway_enrich_neg.png"
+png(filename, width = 6.5*330, height = 4*330, res = 330)
+heatmap_plot_neg
+dev.off()
+
+
+
+```
+
+
+#below is a remnant for MS/MS selecting; compare the features significant here with that list later
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+#write xlsx for both
+#filename <- "../data/plasma metabolomics/annotation_plasma_mx_Mayo.xlsx"
+#list_of_datasets <- list("negative" = ann_neg,
+#                         "positive" = ann_pos)
+#write.xlsx(list_of_datasets, file = filename, append=T, rowNames=T)
+
+
+
+```

@@ -1,0 +1,2354 @@
+---
+title: "202503_ICI_analysis"
+author: "Ruben Mars"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+params:
+  taxa_file_s: "../data/species_phyloseq_ICI_irAE.rds" #need this for the phylogenetic tree information
+  
+output: 
+  html_document:
+    toc: true
+    theme: cerulean
+    
+---
+
+<style type="text/css">
+.main-container {
+  max-width: 1200px;
+  margin-left: auto;
+  margin-right: auto;
+}
+</style>
+
+
+***  
+
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+require(tidyverse)
+require(readxl)
+require(ggplot2)
+require(ggside)
+require(RColorBrewer)
+require(vegan)
+require(ape)
+require(tidyverse)
+require(ggpubr)
+require(cowplot)
+require(randomForest)
+require(ROCR)
+require(gtsummary)
+require(flextable)
+require(gridExtra)
+library(ggpubr)
+require(reshape2)
+require(dplyr)
+require(openxlsx)
+require(knitr)
+#library(devtools)
+#install_github("jokergoo/ComplexHeatmap")
+require(ComplexHeatmap)
+require(circlize)
+require(mlbench)
+require(caret)
+require(ropls)
+require(GUniFrac)
+require(microViz)
+require(phyloseq)
+require(openxlsx)
+
+
+source("helper functions/zicoseq_volcano_plot.R")
+source("helper functions/zicoseq_heatmap_old_colors.R")
+
+```
+
+Run rmarkdown file to load the metadata
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+
+rmarkdown::render("1_ICI_cohort_description.Rmd")
+
+
+```
+
+Load taxonomy
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+#we need the phylo file since it has the phylogenetic tree
+phylo_s <- readRDS(params$taxa_file_s)
+#cbind(rownames(sample_data(phylo_s)), clin_meta$seq_data_BIOME)
+
+
+#rarify and then get relative abundance
+phylo_s.rff <- Rarefy(t(otu_table(phylo_s)), depth=min(colSums(otu_table(phylo_s))))$otu.tab.rff
+
+dim(phylo_s.rff)
+
+#get relative abundance
+phylo_s.rff.ra <- sweep(phylo_s.rff, MARGIN = 1, rowSums(phylo_s.rff), '/')
+
+
+phylo_s_filt <- as.data.frame(otu_table(phylo_s))
+cutoff <- ncol(phylo_s_filt) * 0.95
+phylo_s_filt <- phylo_s_filt[rowSums(phylo_s_filt == 0) < cutoff,]
+dim(phylo_s_filt) #basic filtering to remove the most sparse species, Zicoseq below does more
+# 3185  177
+
+```
+
+Get genus level data
+
+```{r, echo=FALSE, results='hide',message=FALSE}
+
+filename <- "../data/Supplementary Table 1.xlsx"
+
+getSheetNames(filename)
+phylo_g <- as.data.frame(read.xlsx(filename, sheet = "phylo_g", rowNames = T))
+phylo_f <- as.data.frame(read.xlsx(filename, sheet = "phylo_f", rowNames = T))
+phylo_o <- as.data.frame(read.xlsx(filename, sheet = "phylo_o", rowNames = T))
+phylo_p <- as.data.frame(read.xlsx(filename, sheet = "phylo_p", rowNames = T))
+
+#cbind(clin_meta$SubjectID,colnames(phylo_g))
+
+#filter genus level
+phylo_g_filt <- as.data.frame(phylo_g)
+cutoff <- ncol(phylo_g_filt) * 0.95
+phylo_g_filt <- phylo_g_filt[rowSums(phylo_g_filt == 0) < cutoff,]
+dim(phylo_g_filt)
+#907 177
+
+phylo_f_filt <- as.data.frame(phylo_f)
+cutoff <- ncol(phylo_f_filt) * 0.95
+phylo_f_filt <- phylo_f_filt[rowSums(phylo_f_filt == 0) < cutoff,]
+dim(phylo_f_filt)
+#187 177
+
+phylo_o_filt <- as.data.frame(phylo_o)
+cutoff <- ncol(phylo_o_filt) * 0.95
+phylo_o_filt <- phylo_o_filt[rowSums(phylo_o_filt == 0) < cutoff,]
+dim(phylo_o_filt)
+#87 177
+
+
+phylo_p_filt <- as.data.frame(phylo_p)
+cutoff <- ncol(phylo_p_filt) * 0.95
+phylo_p_filt <- phylo_p_filt[rowSums(phylo_p_filt == 0) < cutoff,]
+dim(phylo_p_filt)
+#26 177
+
+
+```
+
+<br>
+
+GUniFrac
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+#on rarified count data, not relative abundance data
+
+dim(phylo_s.rff)
+unique(rowSums(phylo_s.rff))
+
+# Calculate the UniFracs
+unifracs <- GUniFrac(phylo_s.rff, phy_tree(phylo_s), alpha=c(0.5))$unifracs
+
+dim(unifracs)
+#unifracs[,,1]
+
+#dw <- unifracs[, , "d_1"]		# Weighted UniFrac
+#du <- unifracs[, , "d_UW"]		# Unweighted UniFrac	
+#dv <- unifracs[, , "d_VAW"]		# Variance adjusted weighted UniFrac
+#d0 <- unifracs[, , "d_0"]     	# GUniFrac with alpha 0  
+#d5 <- unifracs[, , "d_0.5"]   	# GUniFrac with alpha 0.5 
+
+
+```
+
+
+Alpha diversity analysis
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+#add Shannon diversity to the clin_meta
+
+shannon <- vegan::diversity(phylo_s.rff.ra, index = "shannon")
+simpson <- vegan::diversity(phylo_s.rff.ra, index = "simpson")
+
+
+#adapt below for the version for the main manuscript
+
+lm_res_list <- list(summary(lm(shannon ~ IMDC, data=clin_meta)),
+     summary(lm(shannon ~ hepatitis, data=clin_meta)),
+     summary(lm(shannon ~ pneumonitis, data=clin_meta)),
+     summary(lm(shannon ~ other_irAE, data=clin_meta)),
+     summary(lm(shannon ~ Sex, data=clin_meta)),
+     summary(lm(shannon ~ Elixhauser_elix.sum, data=clin_meta)),
+     summary(lm(shannon ~ Age, data=clin_meta)),
+     summary(lm(shannon ~ abx_last_month, data=clin_meta)),
+     summary(lm(shannon ~ Bristol_score_imputed, data=clin_meta)),
+     summary(lm(shannon ~ BMI, data=clin_meta)))
+
+coeff <- as.numeric(lapply(lm_res_list, function(x) x$coefficients[2,"Estimate"]))
+pvals <- as.numeric(lapply(lm_res_list, function(x) x$coefficients[2,"Pr(>|t|)"]))
+var_names <- as.character(lapply(lm_res_list, function(x) rownames(x$coefficients)[2]))
+
+res_df <- as.data.frame(cbind(coeff, pvals), row.names = var_names)
+res_df_shannon <- res_df[order(res_df$coeff, decreasing = F),]
+
+#look at adjusting
+res_df_shannon$fdr <- p.adjust(res_df_shannon$pvals, "fdr")
+
+#update names
+rownames(res_df_shannon) <- gsub("_", " ", rownames(res_df_shannon))
+rownames(res_df_shannon) <- gsub("elix.sum", "comorbidity", rownames(res_df_shannon))
+rownames(res_df_shannon) <- gsub(" nr imputed", "", rownames(res_df_shannon))
+rownames(res_df_shannon) <- gsub("abx", "Abx", rownames(res_df_shannon))
+rownames(res_df_shannon) <- gsub("any", "Any", rownames(res_df_shannon))
+rownames(res_df_shannon) <- gsub("hepatitis", "Hepatitis", rownames(res_df_shannon))
+rownames(res_df_shannon) <- gsub("other", "Other", rownames(res_df_shannon))
+rownames(res_df_shannon) <- gsub("pneumonitis", "Pneumonitis", rownames(res_df_shannon))
+rownames(res_df_shannon) <- gsub(" curated", "", rownames(res_df_shannon))
+
+#varying color for p values
+#n of group size
+
+#add text annotation above, more dissimilar from healthy controls
+
+colvec <- rep("white", nrow(res_df_shannon))
+colvec[res_df_shannon$pvals < 0.05] <- "darkgrey"
+
+
+filename <- "../figures/barplot alpha div linear model main manuscript nominal p.png"
+png(filename, width = 5.5*330, height = 3.5*330, res = 330)
+
+par(mar=c(3,9,2,1))
+brplot <- barplot(res_df_shannon$coeff, horiz = T, las=1, col = colvec, names.arg = "", xlim=c(-0.4, 0.4), border="darkgrey")
+axis(2, brplot, rownames(res_df_shannon), las=1, tick=F, line = -1)
+text(c(0), 13, labels=expression("higher Shannon diversity" %->% ""), cex=0.8, xpd=TRUE, adj=0, col="darkgrey")
+mtext("lm Beta coefficient", line=2, side=1, cex=0.8)
+mtext("Species alpha diversity", 3, line=-1, cex=1.1, outer=T)
+
+
+dev.off()
+
+
+res_df_shannon[c("Other irAE", "IMDC", "Hepatitis", "Pneumonitis"), "coeff"]
+#0.1312660 -0.1110569 -0.0957686 -0.2236110
+
+
+res_df_shannon
+
+
+
+```
+
+
+Plotting Unifrac analyses for paper, version corrected for batch
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+#cbind(clin_meta$seq_data_BIOME, rownames(phylo_s.rff))
+
+#when this throws an error (e.g. colnames related) try restarting R
+
+set.seed(1)
+# Permanova - Distance based multivariate analysis of variance
+uni_1a <- GUniFrac::adonis3(unifracs[, , "d_0.5"] ~ Batch + IMDC, data = clin_meta, permutations = 999)$aov.tab
+uni_1b <- GUniFrac::adonis3(unifracs[, , "d_0.5"] ~ Batch + hepatitis, data = clin_meta, permutations = 999)$aov.tab
+uni_1c <- GUniFrac::adonis3(unifracs[, , "d_0.5"] ~ Batch + pneumonitis, data = clin_meta, permutations = 999)$aov.tab
+uni_1d <- GUniFrac::adonis3(unifracs[, , "d_0.5"] ~ Batch + other_irAE, data = clin_meta, permutations = 999)$aov.tab
+uni_4 <- GUniFrac::adonis3(unifracs[, , "d_0.5"] ~ Batch + Sex, data = clin_meta, permutations = 999)$aov.tab
+uni_5 <- GUniFrac::adonis3(unifracs[, , "d_0.5"] ~ Batch + Elixhauser_elix.sum, data = clin_meta, permutations = 999)$aov.tab
+uni_6 <- GUniFrac::adonis3(unifracs[, , "d_0.5"] ~ Batch + Age, data = clin_meta, permutations = 999)$aov.tab
+uni_7 <- GUniFrac::adonis3(unifracs[, , "d_0.5"] ~ Batch + abx_last_month, data = clin_meta, permutations = 999)$aov.tab
+uni_8 <- GUniFrac::adonis3(unifracs[, , "d_0.5"] ~ Batch + Bristol_score_imputed, data = clin_meta, permutations = 999)$aov.tab
+uni_9 <- GUniFrac::adonis3(unifracs[, , "d_0.5"] ~ Batch + BMI, data = clin_meta, permutations = 999)$aov.tab
+
+
+beta_res_list <- list(uni_1a, uni_1b, uni_1c, uni_1d, uni_4, uni_5, uni_6, uni_7, uni_8, uni_9)
+
+R2_vals <- unlist(lapply(beta_res_list, function(x) x[,"R2"][2]))
+p_vals <- unlist(lapply(beta_res_list, function(x) x[,"Pr(>F)"][2]))
+beta_res_df <- as.data.frame(cbind(R2_vals, p_vals))
+rownames(beta_res_df) <- as.character(lapply(beta_res_list, function(x) rownames(x)[2]))
+
+#rownames(beta_res_df)[1:5] <- paste0(rownames(beta_res_df)[1:5], "  n=", as.numeric(apply(clin_meta[,rownames(beta_res_df)[1:5]], 2, table)["1",]))
+
+beta_res_df <- beta_res_df[order(beta_res_df$R2_vals, decreasing = F),]
+
+#varying color for p values
+#n of group size
+par(mar=c(4,14,1,1))
+barplot(beta_res_df$R2_vals, horiz = T, las=1, col = beta_res_df$p_vals < 0.05, names.arg = rownames(beta_res_df))
+mtext("R2 % variance explained", line=2.5, side=1)
+
+
+filename <- "../figures/barplot weighted unifrac Batch manuscript.png"
+png(filename, width = 8*330, height = 5*330, res = 330)
+par(mar=c(4,14,1,1))
+barplot(beta_res_df$R2_vals, horiz = T, las=1, col = beta_res_df$p_vals < 0.05, names.arg = rownames(beta_res_df))
+mtext("R2 % variance explained", line=2.5, side=1)
+dev.off()
+
+
+write.csv(beta_res_df, file = "../data/beta_res_df unifrac mgx species batch cor.csv")
+
+
+```
+
+
+Plotting Unifrac analyses without batch very similar
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+#when this throws an error (e.g. colnames related) try restarting R
+
+set.seed(1)
+# Permanova - Distance based multivariate analysis of variance
+uni_1a <- GUniFrac::adonis3(unifracs[, , "d_0.5"] ~ IMDC, data = clin_meta, permutations = 999)$aov.tab
+uni_1b <- GUniFrac::adonis3(unifracs[, , "d_0.5"] ~ hepatitis, data = clin_meta, permutations = 999)$aov.tab
+uni_1c <- GUniFrac::adonis3(unifracs[, , "d_0.5"] ~ pneumonitis, data = clin_meta, permutations = 999)$aov.tab
+uni_1d <- GUniFrac::adonis3(unifracs[, , "d_0.5"] ~ other_irAE, data = clin_meta, permutations = 999)$aov.tab
+uni_1e <- GUniFrac::adonis3(unifracs[, , "d_0.5"] ~ any_toxicity, data = clin_meta, permutations = 999)$aov.tab
+
+uni_4 <- GUniFrac::adonis3(unifracs[, , "d_0.5"] ~ Sex, data = clin_meta, permutations = 999)$aov.tab
+#biggest R2 for elixhauser
+uni_5 <- GUniFrac::adonis3(unifracs[, , "d_0.5"] ~ Elixhauser_elix.sum, data = clin_meta, permutations = 999)$aov.tab
+uni_6 <- GUniFrac::adonis3(unifracs[, , "d_0.5"] ~ Age, data = clin_meta, permutations = 999)$aov.tab
+uni_7 <- GUniFrac::adonis3(unifracs[, , "d_0.5"] ~ abx_last_month, data = clin_meta, permutations = 999)$aov.tab
+uni_8 <- GUniFrac::adonis3(unifracs[, , "d_0.5"] ~ Bristol_score_imputed, data = clin_meta, permutations = 999)$aov.tab
+uni_9 <- GUniFrac::adonis3(unifracs[, , "d_0.5"] ~ BMI, data = clin_meta, permutations = 999)$aov.tab
+
+beta_res_list <- list(uni_1a, uni_1b, uni_1c, uni_1d, uni_1e, uni_4, uni_5, uni_6, uni_7, uni_8, uni_9)
+
+R2_vals <- unlist(lapply(beta_res_list, function(x) x[,"R2"][1]))
+p_vals <- unlist(lapply(beta_res_list, function(x) x[,"Pr(>F)"][1]))
+beta_res_df <- as.data.frame(cbind(R2_vals, p_vals))
+rownames(beta_res_df) <- as.character(lapply(beta_res_list, function(x) rownames(x)[1]))
+
+rownames(beta_res_df)[1:5] <- paste0(rownames(beta_res_df)[1:5], "  n=", as.numeric(apply(clin_meta[,rownames(beta_res_df)[1:5]], 2, table)["1",]))
+
+beta_res_df <- beta_res_df[order(beta_res_df$R2_vals, decreasing = F),]
+
+#varying color for p values
+#n of group size
+par(mar=c(4,14,1,1))
+barplot(beta_res_df$R2_vals, horiz = T, las=1, col = beta_res_df$p_vals < 0.05, names.arg = rownames(beta_res_df))
+mtext("R2 % variance explained", line=2.5, side=1)
+
+
+#write.csv(beta_res_df, file = "../data/beta_res_df unifrac mgx species not cor.csv")
+
+
+```
+
+Adjust for more variables, Age, Bristol Score
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+set.seed(1)
+# Permanova - Distance based multivariate analysis of variance
+uni_1a <- GUniFrac::adonis3(unifracs[, , "d_0.5"] ~ Batch + Age + Bristol_score_imputed + IMDC, data = clin_meta, permutations = 999)$aov.tab
+uni_1b <- GUniFrac::adonis3(unifracs[, , "d_0.5"] ~ Batch + Age + Bristol_score_imputed + hepatitis, data = clin_meta, permutations = 999)$aov.tab
+uni_1c <- GUniFrac::adonis3(unifracs[, , "d_0.5"] ~ Batch + Age + Bristol_score_imputed + pneumonitis, data = clin_meta, permutations = 999)$aov.tab
+uni_1d <- GUniFrac::adonis3(unifracs[, , "d_0.5"] ~ Batch + Age + Bristol_score_imputed + other_irAE, data = clin_meta, permutations = 999)$aov.tab
+
+beta_res_list <- list(uni_1a, uni_1b, uni_1c, uni_1d)
+
+R2_vals <- unlist(lapply(beta_res_list, function(x) x[,"R2"][4]))
+p_vals <- unlist(lapply(beta_res_list, function(x) x[,"Pr(>F)"][4]))
+beta_res_df <- as.data.frame(cbind(R2_vals, p_vals))
+rownames(beta_res_df) <- as.character(lapply(beta_res_list, function(x) rownames(x)[4]))
+
+beta_res_df <- beta_res_df[order(beta_res_df$R2_vals, decreasing = F),]
+
+#varying color for p values
+#n of group size
+par(mar=c(4,14,1,1))
+barplot(beta_res_df$R2_vals, horiz = T, las=1, col = beta_res_df$p_vals < 0.05, names.arg = rownames(beta_res_df))
+mtext("R2 % variance explained", line=2.5, side=1)
+
+write.csv(beta_res_df, file = "../data/beta_res_df_adj unifrac mgx species batch Age Bristol.csv")
+
+
+```
+
+
+Visualize the ordination for Batch
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+sample_data(phylo_s)$Batch <- clin_meta$Batch
+
+phylo_s %>% 
+  tax_transform("identity", rank = "Genus") %>% 
+  dist_calc(dist = "robust.aitchison") %>% 
+  ord_calc("PCoA") %>% 
+  ord_plot(color = "Batch", size = 2) +
+  scale_colour_brewer(palette = "Dark2", aesthetics = c("fill", "colour")) +
+  theme_bw() +
+  ggside::geom_xsideboxplot(aes(fill = Batch, y = Batch), orientation = "y") +
+  ggside::geom_ysideboxplot(aes(fill = Batch, x = Batch), orientation = "x") +
+  ggside::scale_xsidey_discrete(labels = NULL) +
+  ggside::scale_ysidex_discrete(labels = NULL) +
+  ggside::theme_ggside_void()
+
+
+```
+
+
+Visualize the ordination for pneumonitis
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+sample_data(phylo_s)$pneumonitis <- as.factor(clin_meta$pneumonitis)
+
+phylo_s %>% 
+  tax_transform("identity", rank = "Genus") %>% 
+  dist_calc(dist = "robust.aitchison") %>% 
+  ord_calc("PCoA") %>% 
+  ord_plot(color = "pneumonitis", size = 2) +
+  scale_colour_brewer(palette = "Dark2", aesthetics = c("fill", "colour")) +
+  theme_bw() +
+  ggside::geom_xsideboxplot(aes(fill = pneumonitis, y = pneumonitis), orientation = "y") +
+  ggside::geom_ysideboxplot(aes(fill = pneumonitis, x = pneumonitis), orientation = "x") +
+  ggside::scale_xsidey_discrete(labels = NULL) +
+  ggside::scale_ysidex_discrete(labels = NULL) +
+  ggside::theme_ggside_void()
+
+
+```
+
+
+Visualize the ordination for hepatitis
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+sample_data(phylo_s)$hepatitis <- as.factor(clin_meta$hepatitis)
+
+phylo_s %>% 
+  tax_transform("identity", rank = "Genus") %>% 
+  dist_calc(dist = "robust.aitchison") %>% 
+  ord_calc("PCoA") %>% 
+  ord_plot(color = "hepatitis", size = 2) +
+  scale_colour_brewer(palette = "Dark2", aesthetics = c("fill", "colour")) +
+  theme_bw() +
+  ggside::geom_xsideboxplot(aes(fill = hepatitis, y = hepatitis), orientation = "y") +
+  ggside::geom_ysideboxplot(aes(fill = hepatitis, x = hepatitis), orientation = "x") +
+  ggside::scale_xsidey_discrete(labels = NULL) +
+  ggside::scale_ysidex_discrete(labels = NULL) +
+  ggside::theme_ggside_void()
+
+
+```
+
+
+Visualize the ordination for IMDC
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+sample_data(phylo_s)$IMDC <- as.factor(clin_meta$IMDC)
+
+phylo_s %>% 
+  tax_transform("identity", rank = "Genus") %>% 
+  dist_calc(dist = "robust.aitchison") %>% 
+  ord_calc("PCoA") %>% 
+  ord_plot(color = "IMDC", size = 2) +
+  scale_colour_brewer(palette = "Dark2", aesthetics = c("fill", "colour")) +
+  theme_bw() +
+  ggside::geom_xsideboxplot(aes(fill = IMDC, y = IMDC), orientation = "y") +
+  ggside::geom_ysideboxplot(aes(fill = IMDC, x = IMDC), orientation = "x") +
+  ggside::scale_xsidey_discrete(labels = NULL) +
+  ggside::scale_ysidex_discrete(labels = NULL) +
+  ggside::theme_ggside_void()
+
+
+```
+
+
+Diff taxa IMDC; species
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+comm <- as.matrix(phylo_s_filt)
+meta <- clin_meta
+
+
+#adjusted for Batch, Age, Elixhauser score separately. Affects results
+set.seed(1)
+ZicoSeq.obj <- ZicoSeq(meta.dat = meta, feature.dat = comm, 
+                       grp.name = 'IMDC', feature.dat.type = "count", 
+                       adj.name = c('Age', 'Bristol_score_imputed'), 
+                       # Filter to remove rare taxa
+                       prev.filter = 0.1, mean.abund.filter = 0.0001,  
+                       max.abund.filter = 0.003, min.prop = 0, 
+                       # Winsorization to replace outliers
+                       is.winsor = TRUE, outlier.pct = 0.03, winsor.end = 'top',
+                       # Posterior sampling 
+                       is.post.sample = TRUE, post.sample.no = 25, 
+                       # Use the square-root transformation
+                       link.func = list(function (x) x^0.5), 
+                       stats.combine.func = max,
+                       # Permutation-based multiple testing correction
+                       perm.no = 999,  strata = NULL, 
+                       # Reference-based multiple stage normalization
+                       ref.pct = 0.5, stage.no = 6, excl.pct = 0.2,
+                       # Family-wise error rate control
+                       is.fwer = TRUE, verbose = TRUE, return.feature.dat = T)
+
+ZicoSeq.obj.IMDC <- ZicoSeq.obj
+
+zico.obj <- ZicoSeq.obj.IMDC
+
+grp.name = 'IMDC' # used for extract coefficient
+p.cutoff = 0.01 # design our expected significance level
+top.n = 15 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "raw" #or "adj"
+
+output_plot <- zicoseq_volcano_plot(zico.obj, grp.name, p.cutoff, top.n, p_value_class)
+output_plot$output_plot
+
+temp_microbiome_names <- output_plot$res_df$otu[which(output_plot$res_df$p.raw <= p.cutoff)]
+
+
+
+grp.name = 'IMDC' # used for extract coefficient
+p.cutoff = 0.1 # design our expected significance level
+top.n = 15 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "adj" #or "adj"
+
+output_plot <- zicoseq_volcano_plot(zico.obj, grp.name, p.cutoff, top.n, p_value_class)
+output_plot$output_plot
+
+
+```
+
+
+Plot some of the trends species IMDC
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+
+tax_df <- as.matrix(t(phylo_s.rff.ra))*100
+
+plot_list <- list()
+for (i in 1:length(temp_microbiome_names)) {
+  
+  plot_df <- as.data.frame(cbind(as.numeric(tax_df[temp_microbiome_names[i],]), clin_meta$IMDC))
+  names(plot_df) <- c("ra", "IMDC")
+  plot_df$ra <- as.numeric(plot_df$ra)
+
+  p_plot <-  ggboxplot(plot_df, "IMDC", "ra",
+    color = "IMDC", palette=brewer.pal(n = 9, "BuGn")[6:9],
+    add = "jitter", ylab= "sqrt(relative_abundance)") +
+    scale_y_continuous(trans='sqrt') +
+    ggtitle(temp_microbiome_names[i]) +
+    theme(legend.position="none")
+  
+  plot_list[[i]] <- p_plot
+  
+  print(p_plot)
+  
+  filename <- paste0("../figures/taxa comparisons/IMDC_species_", temp_microbiome_names[i], ".png")
+  ggsave(filename, p_plot, device="png", width=3.5, height=2.75)
+  
+}
+
+#also combine all into one figure
+#length(plot_list) 8 
+
+
+filename <- "../figures/taxa comparisons/IMDC_species_comb_grid.png"
+p_plot <- grid.arrange(plot_list[[1]], plot_list[[2]], plot_list[[3]], plot_list[[4]],
+             plot_list[[5]], nrow=3)
+ggsave(filename, p_plot, device="png", width=12, height=9)
+
+
+
+
+```
+
+Diff taxa IMDC; genus
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+comm <- as.matrix(phylo_g_filt)
+meta <- clin_meta
+
+#adjusted for Batch, Age, Elixhauser score separately. Affects results
+set.seed(1)
+ZicoSeq.obj <- ZicoSeq(meta.dat = meta, feature.dat = comm, 
+                       grp.name = 'IMDC', feature.dat.type = "count", 
+                       adj.name = c('Age', 'Bristol_score_imputed'), 
+                       # Filter to remove rare taxa
+                       prev.filter = 0.1, mean.abund.filter = 0.0001,  
+                       max.abund.filter = 0.003, min.prop = 0, 
+                       # Winsorization to replace outliers
+                       is.winsor = TRUE, outlier.pct = 0.03, winsor.end = 'top',
+                       # Posterior sampling 
+                       is.post.sample = TRUE, post.sample.no = 25, 
+                       # Use the square-root transformation
+                       link.func = list(function (x) x^0.5), 
+                       stats.combine.func = max,
+                       # Permutation-based multiple testing correction
+                       perm.no = 999,  strata = NULL, 
+                       # Reference-based multiple stage normalization
+                       ref.pct = 0.5, stage.no = 6, excl.pct = 0.2,
+                       # Family-wise error rate control
+                       is.fwer = TRUE, verbose = TRUE, return.feature.dat = T)
+
+ZicoSeq.obj.IMDC_g <- ZicoSeq.obj
+
+grp.name = 'IMDC' # used for extract coefficient
+p.cutoff = 0.01 # design our expected significance level
+top.n = 15 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "raw" #or "adj"
+
+output_plot <- zicoseq_volcano_plot(ZicoSeq.obj, grp.name, p.cutoff, top.n, p_value_class)
+output_plot$output_plot
+
+
+```
+
+
+Diff taxa IMDC; family
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+comm <- as.matrix(phylo_f_filt)
+meta <- clin_meta
+
+#adjusted for Batch, Age, Elixhauser score separately. Affects results
+set.seed(1)
+ZicoSeq.obj <- ZicoSeq(meta.dat = meta, feature.dat = comm, 
+                       grp.name = 'IMDC', feature.dat.type = "count", 
+                       adj.name = c('Age', 'Bristol_score_imputed'), 
+                       # Filter to remove rare taxa
+                       prev.filter = 0.1, mean.abund.filter = 0.0001,  
+                       max.abund.filter = 0.003, min.prop = 0, 
+                       # Winsorization to replace outliers
+                       is.winsor = TRUE, outlier.pct = 0.03, winsor.end = 'top',
+                       # Posterior sampling 
+                       is.post.sample = TRUE, post.sample.no = 25, 
+                       # Use the square-root transformation
+                       link.func = list(function (x) x^0.5), 
+                       stats.combine.func = max,
+                       # Permutation-based multiple testing correction
+                       perm.no = 999,  strata = NULL, 
+                       # Reference-based multiple stage normalization
+                       ref.pct = 0.5, stage.no = 6, excl.pct = 0.2,
+                       # Family-wise error rate control
+                       is.fwer = TRUE, verbose = TRUE, return.feature.dat = T)
+
+ZicoSeq.obj.IMDC_f <- ZicoSeq.obj
+
+grp.name = 'IMDC' # used for extract coefficient
+p.cutoff = 0.01 # design our expected significance level
+top.n = 15 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "raw" #or "adj"
+
+output_plot <- zicoseq_volcano_plot(ZicoSeq.obj, grp.name, p.cutoff, top.n, p_value_class)
+output_plot$output_plot
+
+
+```
+
+
+Diff taxa IMDC; order
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+comm <- as.matrix(phylo_o_filt)
+meta <- clin_meta
+
+#adjusted for Batch, Age, Elixhauser score separately. Affects results
+set.seed(1)
+ZicoSeq.obj <- ZicoSeq(meta.dat = meta, feature.dat = comm, 
+                       grp.name = 'IMDC', feature.dat.type = "count", 
+                       adj.name = c('Age', 'Bristol_score_imputed'), 
+                       # Filter to remove rare taxa
+                       prev.filter = 0.1, mean.abund.filter = 0.0001,  
+                       max.abund.filter = 0.003, min.prop = 0, 
+                       # Winsorization to replace outliers
+                       is.winsor = TRUE, outlier.pct = 0.03, winsor.end = 'top',
+                       # Posterior sampling 
+                       is.post.sample = TRUE, post.sample.no = 25, 
+                       # Use the square-root transformation
+                       link.func = list(function (x) x^0.5), 
+                       stats.combine.func = max,
+                       # Permutation-based multiple testing correction
+                       perm.no = 999,  strata = NULL, 
+                       # Reference-based multiple stage normalization
+                       ref.pct = 0.5, stage.no = 6, excl.pct = 0.2,
+                       # Family-wise error rate control
+                       is.fwer = TRUE, verbose = TRUE, return.feature.dat = T)
+
+ZicoSeq.obj.IMDC_o <- ZicoSeq.obj
+
+grp.name = 'IMDC' # used for extract coefficient
+p.cutoff = 0.01 # design our expected significance level
+top.n = 15 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "raw" #or "adj"
+
+output_plot <- zicoseq_volcano_plot(ZicoSeq.obj, grp.name, p.cutoff, top.n, p_value_class)
+output_plot$output_plot
+
+
+```
+
+
+Diff taxa IMDC; phylum
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+comm <- as.matrix(phylo_p_filt)
+meta <- clin_meta
+
+#adjusted for Batch, Age, Elixhauser score separately. Affects results
+set.seed(1)
+ZicoSeq.obj <- ZicoSeq(meta.dat = meta, feature.dat = comm, 
+                       grp.name = 'IMDC', feature.dat.type = "count", 
+                       adj.name = c('Age', 'Bristol_score_imputed'), 
+                       # Filter to remove rare taxa
+                       prev.filter = 0.1, mean.abund.filter = 0.0001,  
+                       max.abund.filter = 0.003, min.prop = 0, 
+                       # Winsorization to replace outliers
+                       is.winsor = TRUE, outlier.pct = 0.03, winsor.end = 'top',
+                       # Posterior sampling 
+                       is.post.sample = TRUE, post.sample.no = 25, 
+                       # Use the square-root transformation
+                       link.func = list(function (x) x^0.5), 
+                       stats.combine.func = max,
+                       # Permutation-based multiple testing correction
+                       perm.no = 999,  strata = NULL, 
+                       # Reference-based multiple stage normalization
+                       ref.pct = 0.5, stage.no = 6, excl.pct = 0.2,
+                       # Family-wise error rate control
+                       is.fwer = TRUE, verbose = TRUE, return.feature.dat = T)
+
+ZicoSeq.obj.IMDC_p <- ZicoSeq.obj
+
+grp.name = 'IMDC' # used for extract coefficient
+p.cutoff = 0.01 # design our expected significance level
+top.n = 15 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "raw" #or "adj"
+
+output_plot <- zicoseq_volcano_plot(ZicoSeq.obj, grp.name, p.cutoff, top.n, p_value_class)
+output_plot$output_plot
+
+
+```
+
+
+Diff taxa hepatitis; species 
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+comm <- as.matrix(phylo_s_filt)
+meta <- clin_meta
+
+#adjusted for Batch, Age, Elixhauser score separately. Affects results
+set.seed(1)
+ZicoSeq.obj <- ZicoSeq(meta.dat = meta, feature.dat = comm, 
+                       grp.name = 'hepatitis', feature.dat.type = "count", 
+                       adj.name = c('Age', 'Bristol_score_imputed'), 
+                       # Filter to remove rare taxa
+                       prev.filter = 0.1, mean.abund.filter = 0.0001,  
+                       max.abund.filter = 0.003, min.prop = 0, 
+                       # Winsorization to replace outliers
+                       is.winsor = TRUE, outlier.pct = 0.03, winsor.end = 'top',
+                       # Posterior sampling 
+                       is.post.sample = TRUE, post.sample.no = 25, 
+                       # Use the square-root transformation
+                       link.func = list(function (x) x^0.5), 
+                       stats.combine.func = max,
+                       # Permutation-based multiple testing correction
+                       perm.no = 999,  strata = NULL, 
+                       # Reference-based multiple stage normalization
+                       ref.pct = 0.5, stage.no = 6, excl.pct = 0.2,
+                       # Family-wise error rate control
+                       is.fwer = TRUE, verbose = TRUE, return.feature.dat = T)
+
+
+ZicoSeq.obj.hepatitis <- ZicoSeq.obj
+
+zico.obj <- ZicoSeq.obj.hepatitis
+
+grp.name = 'hepatitis' # used to extract coefficient
+p.cutoff = 0.01 # design our expected significance level
+top.n = 12 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "raw" #or "adj"
+
+output_plot <- zicoseq_volcano_plot(zico.obj, grp.name, p.cutoff, top.n, p_value_class)
+output_plot
+
+temp_microbiome_names <- output_plot$res_df$otu[which(output_plot$res_df$p.raw <= p.cutoff)]
+
+
+
+#make version with fdr
+grp.name = 'hepatitis' # used for extract coefficient
+p.cutoff = 0.2 # design our expected significance level
+top.n = 12 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "adj" #or "adj"
+
+output_plot <- zicoseq_volcano_plot(zico.obj, grp.name, p.cutoff, top.n, p_value_class)
+output_plot
+
+
+
+
+```
+
+
+Plot some of the trends species hepatitis
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+
+tax_df <- as.matrix(t(phylo_s.rff.ra))*100
+
+plot_list <- list()
+for (i in 1:length(temp_microbiome_names)) {
+  
+  plot_df <- as.data.frame(cbind(as.numeric(tax_df[temp_microbiome_names[i],]), meta$hepatitis))
+  names(plot_df) <- c("ra", "hepatitis")
+  plot_df$ra <- as.numeric(plot_df$ra)
+
+  p_plot <-  ggboxplot(plot_df, "hepatitis", "ra",
+    color = "hepatitis", palette=brewer.pal(n = 9, "BuGn")[6:9],
+    add = "jitter", ylab= "sqrt(relative_abundance)") +
+    scale_y_continuous(trans='sqrt') +
+    ggtitle(temp_microbiome_names[i]) +
+    theme(legend.position="none")
+  
+  print(p_plot)
+  
+  filename <- paste0("../figures/taxa comparisons/ICI_hepatitis_species_", temp_microbiome_names[i], ".png")
+  ggsave(filename, p_plot, device="png", width=4, height=2.75)
+  
+}
+
+
+```
+
+
+Diff taxa Hepatitis; genus
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+comm <- as.matrix(phylo_g_filt)
+meta <- clin_meta
+
+#adjusted for Batch, Age, Elixhauser score separately. Affects results
+set.seed(1)
+ZicoSeq.obj <- ZicoSeq(meta.dat = meta, feature.dat = comm, 
+                       grp.name = 'hepatitis', feature.dat.type = "count", 
+                       adj.name = c('Age', 'Bristol_score_imputed'), 
+                       # Filter to remove rare taxa
+                       prev.filter = 0.1, mean.abund.filter = 0.0001,  
+                       max.abund.filter = 0.003, min.prop = 0, 
+                       # Winsorization to replace outliers
+                       is.winsor = TRUE, outlier.pct = 0.03, winsor.end = 'top',
+                       # Posterior sampling 
+                       is.post.sample = TRUE, post.sample.no = 25, 
+                       # Use the square-root transformation
+                       link.func = list(function (x) x^0.5), 
+                       stats.combine.func = max,
+                       # Permutation-based multiple testing correction
+                       perm.no = 999,  strata = NULL, 
+                       # Reference-based multiple stage normalization
+                       ref.pct = 0.5, stage.no = 6, excl.pct = 0.2,
+                       # Family-wise error rate control
+                       is.fwer = TRUE, verbose = TRUE, return.feature.dat = T)
+
+ZicoSeq.obj.hepatitis_g <- ZicoSeq.obj
+
+grp.name = 'hepatitis' # used for extract coefficient
+p.cutoff = 0.01 # design our expected significance level
+top.n = 15 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "raw" #or "adj"
+
+output_plot <- zicoseq_volcano_plot(ZicoSeq.obj, grp.name, p.cutoff, top.n, p_value_class)
+output_plot$output_plot
+
+
+grp.name = 'hepatitis' # used for extract coefficient
+p.cutoff = 0.2 # design our expected significance level
+top.n = 15 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "adj" #or "adj"
+
+output_plot <- zicoseq_volcano_plot(ZicoSeq.obj, grp.name, p.cutoff, top.n, p_value_class)
+output_plot$output_plot
+
+
+
+```
+
+
+Diff taxa Hepatitis; family
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+comm <- as.matrix(phylo_f_filt)
+meta <- clin_meta
+
+#adjusted for Batch, Age, Elixhauser score separately. Affects results
+set.seed(1)
+ZicoSeq.obj <- ZicoSeq(meta.dat = meta, feature.dat = comm, 
+                       grp.name = 'hepatitis', feature.dat.type = "count", 
+                       adj.name = c('Age', 'Bristol_score_imputed'), 
+                       # Filter to remove rare taxa
+                       prev.filter = 0.1, mean.abund.filter = 0.0001,  
+                       max.abund.filter = 0.003, min.prop = 0, 
+                       # Winsorization to replace outliers
+                       is.winsor = TRUE, outlier.pct = 0.03, winsor.end = 'top',
+                       # Posterior sampling 
+                       is.post.sample = TRUE, post.sample.no = 25, 
+                       # Use the square-root transformation
+                       link.func = list(function (x) x^0.5), 
+                       stats.combine.func = max,
+                       # Permutation-based multiple testing correction
+                       perm.no = 999,  strata = NULL, 
+                       # Reference-based multiple stage normalization
+                       ref.pct = 0.5, stage.no = 6, excl.pct = 0.2,
+                       # Family-wise error rate control
+                       is.fwer = TRUE, verbose = TRUE, return.feature.dat = T)
+
+ZicoSeq.obj.hepatitis_f <- ZicoSeq.obj
+
+grp.name = 'hepatitis' # used for extract coefficient
+p.cutoff = 0.01 # design our expected significance level
+top.n = 15 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "raw" #or "adj"
+
+output_plot <- zicoseq_volcano_plot(ZicoSeq.obj, grp.name, p.cutoff, top.n, p_value_class)
+output_plot$output_plot
+
+
+```
+
+Diff taxa Hepatitis; order
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+comm <- as.matrix(phylo_o_filt)
+meta <- clin_meta
+
+#adjusted for Batch, Age, Elixhauser score separately. Affects results
+set.seed(1)
+ZicoSeq.obj <- ZicoSeq(meta.dat = meta, feature.dat = comm, 
+                       grp.name = 'hepatitis', feature.dat.type = "count", 
+                       adj.name = c('Age', 'Bristol_score_imputed'), 
+                       # Filter to remove rare taxa
+                       prev.filter = 0.1, mean.abund.filter = 0.0001,  
+                       max.abund.filter = 0.003, min.prop = 0, 
+                       # Winsorization to replace outliers
+                       is.winsor = TRUE, outlier.pct = 0.03, winsor.end = 'top',
+                       # Posterior sampling 
+                       is.post.sample = TRUE, post.sample.no = 25, 
+                       # Use the square-root transformation
+                       link.func = list(function (x) x^0.5), 
+                       stats.combine.func = max,
+                       # Permutation-based multiple testing correction
+                       perm.no = 999,  strata = NULL, 
+                       # Reference-based multiple stage normalization
+                       ref.pct = 0.5, stage.no = 6, excl.pct = 0.2,
+                       # Family-wise error rate control
+                       is.fwer = TRUE, verbose = TRUE, return.feature.dat = T)
+
+ZicoSeq.obj.hepatitis_o <- ZicoSeq.obj
+
+grp.name = 'hepatitis' # used for extract coefficient
+p.cutoff = 0.01 # design our expected significance level
+top.n = 15 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "raw" #or "adj"
+
+output_plot <- zicoseq_volcano_plot(ZicoSeq.obj, grp.name, p.cutoff, top.n, p_value_class)
+output_plot$output_plot
+
+
+```
+
+
+Diff taxa Hepatitis; phylum
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+comm <- as.matrix(phylo_p_filt)
+meta <- clin_meta
+
+#adjusted for Batch, Age, Elixhauser score separately. Affects results
+set.seed(1)
+ZicoSeq.obj <- ZicoSeq(meta.dat = meta, feature.dat = comm, 
+                       grp.name = 'hepatitis', feature.dat.type = "count", 
+                       adj.name = c('Age', 'Bristol_score_imputed'), 
+                       # Filter to remove rare taxa
+                       prev.filter = 0.1, mean.abund.filter = 0.0001,  
+                       max.abund.filter = 0.003, min.prop = 0, 
+                       # Winsorization to replace outliers
+                       is.winsor = TRUE, outlier.pct = 0.03, winsor.end = 'top',
+                       # Posterior sampling 
+                       is.post.sample = TRUE, post.sample.no = 25, 
+                       # Use the square-root transformation
+                       link.func = list(function (x) x^0.5), 
+                       stats.combine.func = max,
+                       # Permutation-based multiple testing correction
+                       perm.no = 999,  strata = NULL, 
+                       # Reference-based multiple stage normalization
+                       ref.pct = 0.5, stage.no = 6, excl.pct = 0.2,
+                       # Family-wise error rate control
+                       is.fwer = TRUE, verbose = TRUE, return.feature.dat = T)
+
+ZicoSeq.obj.hepatitis_p <- ZicoSeq.obj
+
+grp.name = 'hepatitis' # used for extract coefficient
+p.cutoff = 0.01 # design our expected significance level
+top.n = 15 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "raw" #or "adj"
+
+output_plot <- zicoseq_volcano_plot(ZicoSeq.obj, grp.name, p.cutoff, top.n, p_value_class)
+output_plot$output_plot
+
+
+```
+
+Diff taxa pneumonitis; species 
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+comm <- as.matrix(phylo_s_filt)
+meta <- clin_meta
+
+#adjusted for Batch, Age, Elixhauser score separately. Affects results
+set.seed(1)
+ZicoSeq.obj <- ZicoSeq(meta.dat = meta, feature.dat = comm, 
+                       grp.name = 'pneumonitis', feature.dat.type = "count", 
+                       adj.name = c('Age', 'Bristol_score_imputed'), 
+                       # Filter to remove rare taxa
+                       prev.filter = 0.1, mean.abund.filter = 0.0001,  
+                       max.abund.filter = 0.003, min.prop = 0, 
+                       # Winsorization to replace outliers
+                       is.winsor = TRUE, outlier.pct = 0.03, winsor.end = 'top',
+                       # Posterior sampling 
+                       is.post.sample = TRUE, post.sample.no = 25, 
+                       # Use the square-root transformation
+                       link.func = list(function (x) x^0.5), 
+                       stats.combine.func = max,
+                       # Permutation-based multiple testing correction
+                       perm.no = 999,  strata = NULL, 
+                       # Reference-based multiple stage normalization
+                       ref.pct = 0.5, stage.no = 6, excl.pct = 0.2,
+                       # Family-wise error rate control
+                       is.fwer = TRUE, verbose = TRUE, return.feature.dat = T)
+
+ZicoSeq.obj.pneumonitis.patients <- ZicoSeq.obj
+
+grp.name = 'pneumonitis' # used for extract coefficient
+p.cutoff = 0.01 # design our expected significance level
+top.n = 12 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "raw" #or "adj"
+
+output_plot <- zicoseq_volcano_plot(ZicoSeq.obj, grp.name, p.cutoff, top.n, p_value_class)
+output_plot
+
+temp_microbiome_names <- output_plot$res_df$otu[which(output_plot$res_df$p.raw <= p.cutoff)]
+
+
+```
+
+
+Plot some of the trends species pneumonitis
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+
+tax_df <- as.matrix(t(phylo_s.rff.ra))*100
+
+plot_list <- list()
+for (i in 1:length(temp_microbiome_names)) {
+  
+  plot_df <- as.data.frame(cbind(as.numeric(tax_df[temp_microbiome_names[i],]), clin_meta$pneumonitis))
+  names(plot_df) <- c("ra", "pneumonitis")
+  plot_df$ra <- as.numeric(plot_df$ra)
+
+  p_plot <-  ggboxplot(plot_df, "pneumonitis", "ra",
+    color = "pneumonitis", palette=brewer.pal(n = 9, "BuGn")[6:9],
+    add = "jitter", ylab= "sqrt(relative_abundance)") +
+    scale_y_continuous(trans='sqrt') +
+    ggtitle(temp_microbiome_names[i]) +
+    theme(legend.position="none")
+  
+  plot_list[[i]] <- p_plot
+  
+  print(p_plot)
+  
+  filename <- paste0("../figures/taxa comparisons/pneumonitis_species_", temp_microbiome_names[i], ".png")
+  ggsave(filename, p_plot, device="png", width=3.5, height=2.75)
+  
+}
+
+#also combine all into one figure
+#length(plot_list) 8 
+
+
+
+```
+
+
+Diff taxa Pneumonitis; genus
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+comm <- as.matrix(phylo_g_filt)
+meta <- clin_meta
+
+#adjusted for Batch, Age, Elixhauser score separately. Affects results
+set.seed(1)
+ZicoSeq.obj <- ZicoSeq(meta.dat = meta, feature.dat = comm, 
+                       grp.name = 'pneumonitis', feature.dat.type = "count", 
+                       adj.name = c('Age', 'Bristol_score_imputed'), 
+                       # Filter to remove rare taxa
+                       prev.filter = 0.1, mean.abund.filter = 0.0001,  
+                       max.abund.filter = 0.003, min.prop = 0, 
+                       # Winsorization to replace outliers
+                       is.winsor = TRUE, outlier.pct = 0.03, winsor.end = 'top',
+                       # Posterior sampling 
+                       is.post.sample = TRUE, post.sample.no = 25, 
+                       # Use the square-root transformation
+                       link.func = list(function (x) x^0.5), 
+                       stats.combine.func = max,
+                       # Permutation-based multiple testing correction
+                       perm.no = 999,  strata = NULL, 
+                       # Reference-based multiple stage normalization
+                       ref.pct = 0.5, stage.no = 6, excl.pct = 0.2,
+                       # Family-wise error rate control
+                       is.fwer = TRUE, verbose = TRUE, return.feature.dat = T)
+
+ZicoSeq.obj.pneumonitis_g <- ZicoSeq.obj
+
+grp.name = 'pneumonitis' # used for extract coefficient
+p.cutoff = 0.01 # design our expected significance level
+top.n = 15 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "raw" #or "adj"
+
+output_plot <- zicoseq_volcano_plot(ZicoSeq.obj, grp.name, p.cutoff, top.n, p_value_class)
+output_plot$output_plot
+
+temp_microbiome_names <- output_plot$res_df$otu[which(output_plot$res_df$p.raw <= p.cutoff)]
+
+
+grp.name = 'pneumonitis' # used for extract coefficient
+p.cutoff = 0.1 # design our expected significance level
+top.n = 15 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "adj" #or "raw"
+
+output_plot <- zicoseq_volcano_plot(ZicoSeq.obj, grp.name, p.cutoff, top.n, p_value_class)
+output_plot$output_plot
+
+
+```
+
+
+Plot some of the trends genus pneumonitis
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+
+tax_df <- as.matrix(phylo_g_filt)
+
+plot_list <- list()
+for (i in 1:length(temp_microbiome_names)) {
+  
+  plot_df <- as.data.frame(cbind(as.numeric(tax_df[temp_microbiome_names[i],]), clin_meta$pneumonitis))
+  names(plot_df) <- c("ra", "pneumonitis")
+  plot_df$ra <- as.numeric(plot_df$ra)
+
+  p_plot <-  ggboxplot(plot_df, "pneumonitis", "ra",
+    color = "pneumonitis", palette=brewer.pal(n = 9, "BuGn")[6:9],
+    add = "jitter", ylab= "sqrt(relative_abundance)") +
+    scale_y_continuous(trans='sqrt') +
+    ggtitle(temp_microbiome_names[i]) +
+    theme(legend.position="none")
+  
+  plot_list[[i]] <- p_plot
+  
+  print(p_plot)
+  
+  filename <- paste0("../figures/taxa comparisons/pneumonitis_genera_", temp_microbiome_names[i], ".png")
+  ggsave(filename, p_plot, device="png", width=3.5, height=2.75)
+  
+}
+
+#also combine all into one figure
+#length(plot_list) 8 
+
+
+
+```
+
+
+Diff taxa Pneumonitis; family
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+comm <- as.matrix(phylo_f_filt)
+meta <- clin_meta
+
+#adjusted for Batch, Age, Elixhauser score separately. Affects results
+set.seed(1)
+ZicoSeq.obj <- ZicoSeq(meta.dat = meta, feature.dat = comm, 
+                       grp.name = 'pneumonitis', feature.dat.type = "count", 
+                       adj.name = c('Age', 'Bristol_score_imputed'), 
+                       # Filter to remove rare taxa
+                       prev.filter = 0.1, mean.abund.filter = 0.0001,  
+                       max.abund.filter = 0.003, min.prop = 0, 
+                       # Winsorization to replace outliers
+                       is.winsor = TRUE, outlier.pct = 0.03, winsor.end = 'top',
+                       # Posterior sampling 
+                       is.post.sample = TRUE, post.sample.no = 25, 
+                       # Use the square-root transformation
+                       link.func = list(function (x) x^0.5), 
+                       stats.combine.func = max,
+                       # Permutation-based multiple testing correction
+                       perm.no = 999,  strata = NULL, 
+                       # Reference-based multiple stage normalization
+                       ref.pct = 0.5, stage.no = 6, excl.pct = 0.2,
+                       # Family-wise error rate control
+                       is.fwer = TRUE, verbose = TRUE, return.feature.dat = T)
+
+ZicoSeq.obj.pneumonitis_f <- ZicoSeq.obj
+
+grp.name = 'pneumonitis' # used for extract coefficient
+p.cutoff = 0.01 # design our expected significance level
+top.n = 15 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "raw" #or "adj"
+
+output_plot <- zicoseq_volcano_plot(ZicoSeq.obj, grp.name, p.cutoff, top.n, p_value_class)
+output_plot$output_plot
+
+
+
+grp.name = 'pneumonitis' # used for extract coefficient
+p.cutoff = 0.1 # design our expected significance level
+top.n = 15 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "adj" #or "raw"
+
+output_plot <- zicoseq_volcano_plot(ZicoSeq.obj, grp.name, p.cutoff, top.n, p_value_class)
+output_plot$output_plot
+
+
+```
+
+
+Diff taxa Pneumonitis; order
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+comm <- as.matrix(phylo_o_filt)
+meta <- clin_meta
+
+#adjusted for Batch, Age, Elixhauser score separately. Affects results
+set.seed(1)
+ZicoSeq.obj <- ZicoSeq(meta.dat = meta, feature.dat = comm, 
+                       grp.name = 'pneumonitis', feature.dat.type = "count", 
+                       adj.name = c('Age', 'Bristol_score_imputed'), 
+                       # Filter to remove rare taxa
+                       prev.filter = 0.1, mean.abund.filter = 0.0001,  
+                       max.abund.filter = 0.003, min.prop = 0, 
+                       # Winsorization to replace outliers
+                       is.winsor = TRUE, outlier.pct = 0.03, winsor.end = 'top',
+                       # Posterior sampling 
+                       is.post.sample = TRUE, post.sample.no = 25, 
+                       # Use the square-root transformation
+                       link.func = list(function (x) x^0.5), 
+                       stats.combine.func = max,
+                       # Permutation-based multiple testing correction
+                       perm.no = 999,  strata = NULL, 
+                       # Reference-based multiple stage normalization
+                       ref.pct = 0.5, stage.no = 6, excl.pct = 0.2,
+                       # Family-wise error rate control
+                       is.fwer = TRUE, verbose = TRUE, return.feature.dat = T)
+
+ZicoSeq.obj.pneumonitis_o <- ZicoSeq.obj
+
+grp.name = 'pneumonitis' # used for extract coefficient
+p.cutoff = 0.01 # design our expected significance level
+top.n = 15 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "raw" #or "adj"
+
+output_plot <- zicoseq_volcano_plot(ZicoSeq.obj, grp.name, p.cutoff, top.n, p_value_class)
+output_plot$output_plot
+
+
+
+grp.name = 'pneumonitis' # used for extract coefficient
+p.cutoff = 0.1 # design our expected significance level
+top.n = 15 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "adj" #or "raw"
+
+output_plot <- zicoseq_volcano_plot(ZicoSeq.obj, grp.name, p.cutoff, top.n, p_value_class)
+output_plot$output_plot
+
+
+```
+
+
+Diff taxa Pneumonitis; phylum
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+comm <- as.matrix(phylo_p_filt)
+meta <- clin_meta
+
+#adjusted for Batch, Age, Elixhauser score separately. Affects results
+set.seed(1)
+ZicoSeq.obj <- ZicoSeq(meta.dat = meta, feature.dat = comm, 
+                       grp.name = 'pneumonitis', feature.dat.type = "count", 
+                       adj.name = c('Age', 'Bristol_score_imputed'), 
+                       # Filter to remove rare taxa
+                       prev.filter = 0.1, mean.abund.filter = 0.0001,  
+                       max.abund.filter = 0.003, min.prop = 0, 
+                       # Winsorization to replace outliers
+                       is.winsor = TRUE, outlier.pct = 0.03, winsor.end = 'top',
+                       # Posterior sampling 
+                       is.post.sample = TRUE, post.sample.no = 25, 
+                       # Use the square-root transformation
+                       link.func = list(function (x) x^0.5), 
+                       stats.combine.func = max,
+                       # Permutation-based multiple testing correction
+                       perm.no = 999,  strata = NULL, 
+                       # Reference-based multiple stage normalization
+                       ref.pct = 0.5, stage.no = 6, excl.pct = 0.2,
+                       # Family-wise error rate control
+                       is.fwer = TRUE, verbose = TRUE, return.feature.dat = T)
+
+ZicoSeq.obj.pneumonitis_p <- ZicoSeq.obj
+
+grp.name = 'pneumonitis' # used for extract coefficient
+p.cutoff = 0.01 # design our expected significance level
+top.n = 15 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "raw" #or "adj"
+
+output_plot <- zicoseq_volcano_plot(ZicoSeq.obj, grp.name, p.cutoff, top.n, p_value_class)
+output_plot$output_plot
+
+
+
+grp.name = 'pneumonitis' # used for extract coefficient
+p.cutoff = 0.1 # design our expected significance level
+top.n = 15 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "adj" #or "raw"
+
+output_plot <- zicoseq_volcano_plot(ZicoSeq.obj, grp.name, p.cutoff, top.n, p_value_class)
+output_plot$output_plot
+
+
+```
+
+
+Diff taxa other_irAE; species 
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+
+comm <- as.matrix(phylo_s_filt)
+meta <- clin_meta
+
+#adjusted for Batch, Age, Elixhauser score separately. Affects results
+set.seed(1)
+ZicoSeq.obj <- ZicoSeq(meta.dat = meta, feature.dat = comm, 
+                       grp.name = 'other_irAE', feature.dat.type = "count", 
+                       adj.name = c('Age', 'Bristol_score_imputed'), 
+                       # Filter to remove rare taxa
+                       prev.filter = 0.1, mean.abund.filter = 0.0001,  
+                       max.abund.filter = 0.003, min.prop = 0, 
+                       # Winsorization to replace outliers
+                       is.winsor = TRUE, outlier.pct = 0.03, winsor.end = 'top',
+                       # Posterior sampling 
+                       is.post.sample = TRUE, post.sample.no = 25, 
+                       # Use the square-root transformation
+                       link.func = list(function (x) x^0.5), 
+                       stats.combine.func = max,
+                       # Permutation-based multiple testing correction
+                       perm.no = 999,  strata = NULL, 
+                       # Reference-based multiple stage normalization
+                       ref.pct = 0.5, stage.no = 6, excl.pct = 0.2,
+                       # Family-wise error rate control
+                       is.fwer = TRUE, verbose = TRUE, return.feature.dat = T)
+
+ZicoSeq.obj.other_irAE <- ZicoSeq.obj
+
+grp.name = 'other_irAE' # used for extract coefficient
+p.cutoff = 0.01 # design our expected significance level
+top.n = 12 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "raw" #or "adj"
+
+output_plot <- zicoseq_volcano_plot(ZicoSeq.obj, grp.name, p.cutoff, top.n, p_value_class)
+output_plot
+
+
+
+```
+
+
+Diff taxa other irAE; genus
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+comm <- as.matrix(phylo_g_filt)
+meta <- clin_meta
+
+#adjusted for Batch, Age, Elixhauser score separately. Affects results
+set.seed(1)
+ZicoSeq.obj <- ZicoSeq(meta.dat = meta, feature.dat = comm, 
+                       grp.name = 'other_irAE', feature.dat.type = "count", 
+                       adj.name = c('Age', 'Bristol_score_imputed'), 
+                       # Filter to remove rare taxa
+                       prev.filter = 0.1, mean.abund.filter = 0.0001,  
+                       max.abund.filter = 0.003, min.prop = 0, 
+                       # Winsorization to replace outliers
+                       is.winsor = TRUE, outlier.pct = 0.03, winsor.end = 'top',
+                       # Posterior sampling 
+                       is.post.sample = TRUE, post.sample.no = 25, 
+                       # Use the square-root transformation
+                       link.func = list(function (x) x^0.5), 
+                       stats.combine.func = max,
+                       # Permutation-based multiple testing correction
+                       perm.no = 999,  strata = NULL, 
+                       # Reference-based multiple stage normalization
+                       ref.pct = 0.5, stage.no = 6, excl.pct = 0.2,
+                       # Family-wise error rate control
+                       is.fwer = TRUE, verbose = TRUE, return.feature.dat = T)
+
+ZicoSeq.obj.otherirAE_g <- ZicoSeq.obj
+
+grp.name = 'other_irAE' # used for extract coefficient
+p.cutoff = 0.01 # design our expected significance level
+top.n = 15 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "raw" #or "adj"
+
+output_plot <- zicoseq_volcano_plot(ZicoSeq.obj, grp.name, p.cutoff, top.n, p_value_class)
+output_plot$output_plot
+
+
+```
+
+
+Diff taxa other irAE; family
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+comm <- as.matrix(phylo_f_filt)
+meta <- clin_meta
+
+#adjusted for Batch, Age, Elixhauser score separately. Affects results
+set.seed(1)
+ZicoSeq.obj <- ZicoSeq(meta.dat = meta, feature.dat = comm, 
+                       grp.name = 'other_irAE', feature.dat.type = "count", 
+                       adj.name = c('Age', 'Bristol_score_imputed'), 
+                       # Filter to remove rare taxa
+                       prev.filter = 0.1, mean.abund.filter = 0.0001,  
+                       max.abund.filter = 0.003, min.prop = 0, 
+                       # Winsorization to replace outliers
+                       is.winsor = TRUE, outlier.pct = 0.03, winsor.end = 'top',
+                       # Posterior sampling 
+                       is.post.sample = TRUE, post.sample.no = 25, 
+                       # Use the square-root transformation
+                       link.func = list(function (x) x^0.5), 
+                       stats.combine.func = max,
+                       # Permutation-based multiple testing correction
+                       perm.no = 999,  strata = NULL, 
+                       # Reference-based multiple stage normalization
+                       ref.pct = 0.5, stage.no = 6, excl.pct = 0.2,
+                       # Family-wise error rate control
+                       is.fwer = TRUE, verbose = TRUE, return.feature.dat = T)
+
+ZicoSeq.obj.otherirAE_f <- ZicoSeq.obj
+
+grp.name = 'other_irAE' # used for extract coefficient
+p.cutoff = 0.01 # design our expected significance level
+top.n = 15 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "raw" #or "adj"
+
+output_plot <- zicoseq_volcano_plot(ZicoSeq.obj, grp.name, p.cutoff, top.n, p_value_class)
+output_plot$output_plot
+
+
+```
+
+
+Diff taxa other irAE; order
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+comm <- as.matrix(phylo_o_filt)
+meta <- clin_meta
+
+#adjusted for Batch, Age, Elixhauser score separately. Affects results
+set.seed(1)
+ZicoSeq.obj <- ZicoSeq(meta.dat = meta, feature.dat = comm, 
+                       grp.name = 'other_irAE', feature.dat.type = "count", 
+                       adj.name = c('Age', 'Bristol_score_imputed'), 
+                       # Filter to remove rare taxa
+                       prev.filter = 0.1, mean.abund.filter = 0.0001,  
+                       max.abund.filter = 0.003, min.prop = 0, 
+                       # Winsorization to replace outliers
+                       is.winsor = TRUE, outlier.pct = 0.03, winsor.end = 'top',
+                       # Posterior sampling 
+                       is.post.sample = TRUE, post.sample.no = 25, 
+                       # Use the square-root transformation
+                       link.func = list(function (x) x^0.5), 
+                       stats.combine.func = max,
+                       # Permutation-based multiple testing correction
+                       perm.no = 999,  strata = NULL, 
+                       # Reference-based multiple stage normalization
+                       ref.pct = 0.5, stage.no = 6, excl.pct = 0.2,
+                       # Family-wise error rate control
+                       is.fwer = TRUE, verbose = TRUE, return.feature.dat = T)
+
+ZicoSeq.obj.otherirAE_o <- ZicoSeq.obj
+
+grp.name = 'other_irAE' # used for extract coefficient
+p.cutoff = 0.01 # design our expected significance level
+top.n = 15 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "raw" #or "adj"
+
+output_plot <- zicoseq_volcano_plot(ZicoSeq.obj, grp.name, p.cutoff, top.n, p_value_class)
+output_plot$output_plot
+
+
+```
+
+
+Diff taxa other irAE; phylum
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+comm <- as.matrix(phylo_p_filt)
+meta <- clin_meta
+
+#adjusted for Batch, Age, Elixhauser score separately. Affects results
+set.seed(1)
+ZicoSeq.obj <- ZicoSeq(meta.dat = meta, feature.dat = comm, 
+                       grp.name = 'other_irAE', feature.dat.type = "count", 
+                       adj.name = c('Age', 'Bristol_score_imputed'), 
+                       # Filter to remove rare taxa
+                       prev.filter = 0.1, mean.abund.filter = 0.0001,  
+                       max.abund.filter = 0.003, min.prop = 0, 
+                       # Winsorization to replace outliers
+                       is.winsor = TRUE, outlier.pct = 0.03, winsor.end = 'top',
+                       # Posterior sampling 
+                       is.post.sample = TRUE, post.sample.no = 25, 
+                       # Use the square-root transformation
+                       link.func = list(function (x) x^0.5), 
+                       stats.combine.func = max,
+                       # Permutation-based multiple testing correction
+                       perm.no = 999,  strata = NULL, 
+                       # Reference-based multiple stage normalization
+                       ref.pct = 0.5, stage.no = 6, excl.pct = 0.2,
+                       # Family-wise error rate control
+                       is.fwer = TRUE, verbose = TRUE, return.feature.dat = T)
+
+ZicoSeq.obj.otherirAE_p <- ZicoSeq.obj
+
+grp.name = 'other_irAE' # used for extract coefficient
+p.cutoff = 0.01 # design our expected significance level
+top.n = 15 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "raw" #or "adj"
+
+output_plot <- zicoseq_volcano_plot(ZicoSeq.obj, grp.name, p.cutoff, top.n, p_value_class)
+output_plot$output_plot
+
+
+```
+
+
+IMDC, hepatitis, and pneumonitis heatmap
+
+```{r, echo=FALSE, message=FALSE}
+
+zico_list <- list(ZicoSeq.obj.IMDC, ZicoSeq.obj.hepatitis, ZicoSeq.obj.pneumonitis.patients, ZicoSeq.obj.other_irAE)
+grp.names <- unlist(lapply(zico_list, function(x) rownames(x$coef.list[[1]])[nrow(x$coef.list[[1]])]))
+grp.labels <- c("IMDC", "hepatitis", "pneumonitis", "other irAE")
+sign_cutoffs <- c(0.01) #for stars in plots c(0.2, 0.1, 0.05)
+p_or_q <- "p" #"q"
+
+heatmap_list <- zicoseq_heatmap(zico_list, grp.names, grp.labels, sign_cutoffs, single_cutoff=TRUE, p_or_q, column_name_rot = 40)
+heatmap_list$heatmap_plot
+sign_features_taxa <- heatmap_list$sign_names
+
+filename <- "../figures/taxa ICI sel irAE heatmap 01.png"
+png(filename, width = 6.5*330, height = 6*330, res = 330)
+heatmap_list$heatmap_plot
+dev.off()
+
+
+#0.05 cutoff
+sign_cutoffs <- c(0.05) #for stars in plots c(0.2, 0.1, 0.05)
+p_or_q <- "p" #"q"
+
+heatmap_list <- zicoseq_heatmap(zico_list, grp.names, grp.labels, sign_cutoffs, single_cutoff=TRUE, p_or_q, column_name_rot = 40)
+heatmap_list$heatmap_plot
+sign_features_taxa <- heatmap_list$sign_names
+
+filename <- "../figures/taxa ICI sel irAE heatmap 05.png"
+png(filename, width = 6*330, height = 22*330, res = 330)
+heatmap_list$heatmap_plot
+dev.off()
+
+
+
+```
+
+
+The plot with the 4 groups of irAEs version with the species names on top
+
+```{r, echo=FALSE, message=FALSE}
+
+#read the csv file with otu_data for Family level names
+otu.name <- read.csv("~/Dropbox/Mayo_RS/R/202210 ICI/data/otu_data.csv")
+
+grp.names <- unlist(lapply(zico_list, function(x) rownames(x$coef.list[[1]])[nrow(x$coef.list[[1]])]))
+grp.labels <- c("IMDC", "hepatitis", "pneumonitis", "other irAE")
+
+
+FDR_list <- zico_list
+p_list <- zico_list
+R2_list <- zico_list
+  
+for (i in 1:length(zico_list)) {
+  zico.obj <- zico_list[[i]]
+  FDR_list[[i]]  <- zico.obj$p.adj.fdr
+  p_list[[i]]  <- zico.obj$p.raw
+  r2 <- zico.obj$R2[,'Func1']
+  co <- zico.obj$coef.list[[1]][grep(grp.names[i],rownames(zico.obj$coef.list[[1]])),]
+  R2_list[[i]] <-  r2 * sign(co)
+}
+
+#get taxa in both  
+unique_taxa <- names(which(table(unlist(lapply(FDR_list, names))) == length(grp.labels)))
+
+p_list <- lapply(p_list, function(x) x[unique_taxa])
+q_list <- lapply(FDR_list, function(x) x[unique_taxa])
+R2_list <- lapply(R2_list, function(x) x[unique_taxa])
+
+#cbind these results
+df.p <- do.call(cbind, p_list)
+df.q <- do.call(cbind, q_list)
+df.r2 <- do.call(cbind, R2_list)
+
+cutoff <- 0.01; q.cut1 = 0.001; q.cut2=0.005;q.cut3=0.01
+fdr_cutoffs <- c(0.2)
+fdr.cut1 <- min(fdr_cutoffs)
+
+#P_sig is simply one where a row contains a number 1 below cutoff
+P.sig <- df.p[rowSums(df.p <= cutoff) >= 1,]
+R2.sig <- df.r2[rowSums(df.p <= cutoff) >= 1,]
+
+effect_size_cutoff <- 1
+#add the effect size cutoff, e.g. only top 50% effect sizes, not used
+if (effect_size_cutoff < 1) {
+  R2_temp <- t(R2.sig)
+  P_temp <- t(P.sig)
+  effect_cutoff <- min(sort(apply(abs(R2_temp), 1, max), decreasing=T)[1:nrow(R2_temp)*effect_size_cutoff])
+  effect_idx <- apply(abs(R2_temp), 1, function(x) sum(x > effect_cutoff) > 0)
+  P.sig <- as.matrix(t(P_temp)[effect_idx,, drop =F])
+  R2.sig <- as.matrix(t(R2_temp)[effect_idx,, drop =F])
+}
+
+unique.sig <- rownames(P.sig)
+
+dim(P.sig); dim(R2.sig)
+
+rownames(P.sig) <- gsub('.*;g__|s__','',rownames(P.sig))
+rownames(R2.sig) <- gsub('.*;g__|s__','',rownames(R2.sig))
+rownames(df.q) <- gsub('.*;g__|s__','',rownames(df.q))
+
+
+#The result of this operation will be a new matrix or data frame where each element 
+#has been replaced based on the condition specified: values less than 0.01 are replaced 
+#with 'A', and all other values are replaced with 'B'.
+tmp <- P.sig
+tmp[] <- apply(tmp, 2, function(x) ifelse(x<=0.01,'A','B'))
+tmp <- as.data.frame(tmp) %>% arrange(across(everything()))
+
+P.sig <- t(P.sig[rownames(tmp),])
+R2.sig <- t(R2.sig[rownames(tmp), ])
+
+level <- 'Family'
+
+
+#assign colors to Family otu.name. Subset otu.name by Families that are detected
+otu.name <- otu.name[otu.name$Family %in% rownames(phylo_f_filt),]
+
+#assign all these colors
+col <- c(brewer.pal(12,'Set3'),brewer.pal(12,'Paired'),brewer.pal(9,'Set1'),brewer.pal(8,'Set2'))
+#length(col) #41
+
+###### only do one time here; no need to repeat for genus level below
+# Generate 187 unique random colors
+n <- length(unique(otu.name$Family))
+colors <- character(0)
+
+while (length(colors) < n) {
+  remaining <- n - length(colors)
+  set.seed(8)
+  new_colors <- sprintf("#%06x", sample(0:16777215, remaining, replace = TRUE))
+  colors <- unique(c(colors, new_colors))
+  colors <- colorspace::darken(colors, amount = 0.2)
+}
+colors <- colors[1:n]  # Ensure exact length
+
+names(colors) <- unique(otu.name$Family)
+names(colors) <- gsub('o__|f__|c__|p__|s__|g__','',names(colors))
+######
+
+
+otu.name$Species <- gsub(" ", "_", otu.name$Species)
+
+label <- otu.name[otu.name$Species %in% unique.sig,] %>% dplyr::select(c(level, 'Species')) 
+label$Species <- gsub('o__|f__|c__|p__|s__|g__','',label$Species)
+label <- label[match(rownames(tmp), label$Species),]
+label[,level] <- gsub('o__|f__|c__|p__|g__','',label[,level])
+
+#subset colors
+colors_sub <- colors[names(colors) %in% label$Family]
+col <- colors_sub[label$Family]
+
+ha_combined <- HeatmapAnnotation(
+  ` ` = label[, level],
+  annotation_height = unit(1, "cm"),
+  border = TRUE,
+  col = list(` ` = col),
+  show_legend = F
+)
+
+rownames(R2.sig) <- grp.labels
+colnames(R2.sig) <- gsub("_", " ", colnames(R2.sig))
+rownames(df.q) <- gsub("_", " ", rownames(df.q))
+
+Q.sig <- t(df.q[colnames(R2.sig),])
+
+
+lgd_sig_p = Legend(pch = c("***", "**","*"), type = "points", labels = c("<0.001", "<0.005", "<0.01"), background="white", title = "p")
+lgd_sig_fdr = Legend(labels="<0.2", title = "q", type="points", pch=0, background="white", size=unit(5, "mm"))
+
+
+#make the scale even bidirectional
+scale_max <- max(c(abs(min(R2.sig)), max(R2.sig)))
+
+heatmap_full <- Heatmap(R2.sig, name = "R2", 
+        heatmap_legend_param = list(direction = "vertical"),
+        col = colorRamp2(c(-scale_max, 0, scale_max), 
+                           c("#2171B5",'white', "#FEB24C")),
+        column_gap = unit(1, "mm"), 
+        top_annotation = ha_combined,
+        column_split = (label[,level]),
+        column_title_rot = 30,
+        column_names_max_height = unit(10, "cm"),
+        border = TRUE,
+        column_names_rot = 40,
+        
+        cell_fun = function(j, i, x, y, w, h, fill) {
+          if(P.sig[i,j] <= q.cut1) {
+            grid.text("***", x = x, y = y, hjust = 0.5, vjust = 0.7, gp = gpar(fontsize=12))
+          }else if (P.sig[i,j] <= q.cut2) {
+            grid.text("**", x = x, y = y, hjust = 0.5, vjust = 0.7, gp = gpar(fontsize=12))
+          }else if (P.sig[i,j] <= q.cut3) {
+            grid.text("*", x = x, y = y, hjust = 0.5, vjust = 0.7, gp = gpar(fontsize=12))
+          }
+      # Condition to draw an extra box around specific cells, fdr, only need one
+          if (Q.sig[i, j] <= fdr.cut1) {
+            grid.rect(x = x, y = y, width = w * 0.95, height = h * 0.95,
+              gp = gpar(col = "black", fill = NA, lwd = 1.25))  
+          }
+        },         
+        rect_gp = gpar(col= "white"),
+        show_column_names = T, show_row_names = T,
+        show_column_dend = F,
+        show_row_dend = F,
+        cluster_rows = T,
+        cluster_columns = FALSE,
+        column_names_gp = gpar(fontface = 'italic'),
+        row_names_max_width = max_text_width(rownames(R2.sig), gp = gpar(fontsize = 18))
+) 
+heatmap_full
+
+packed_legends <- packLegend(lgd_sig_p, lgd_sig_fdr, direction = "vertical")
+#packed_legends <- packLegend(lgd_sig_p, direction = "vertical")
+
+heatmap_plot2 <- draw(heatmap_full, padding = unit(c(0.1, 4, 0.1, 0.1), "cm"), annotation_legend_list = list(packed_legends), merge_legend=T) 
+heatmap_plot2
+
+
+png(paste0('../figures/heatmap species_irAE_with_top_bar.png'), width =12*300, height = 4.4*300, res=300)
+
+heatmap_plot2
+
+dev.off()
+
+
+```
+
+
+
+Genus level IMDC, hepatitis, and pneumonitis heatmap
+
+```{r, echo=FALSE, message=FALSE}
+
+
+zico_list <- list(ZicoSeq.obj.IMDC_g, ZicoSeq.obj.hepatitis_g, ZicoSeq.obj.pneumonitis_g, ZicoSeq.obj.otherirAE_g)
+grp.names <- unlist(lapply(zico_list, function(x) rownames(x$coef.list[[1]])[nrow(x$coef.list[[1]])]))
+grp.labels <- c("IMDC", "hepatitis", "pneumonitis", "other irAE")
+
+
+```
+
+
+Genus level heatmap
+
+The plot with the 4 groups of irAEs version with the genus names on top
+
+```{r, echo=FALSE, message=FALSE}
+
+
+grp.names <- unlist(lapply(zico_list, function(x) rownames(x$coef.list[[1]])[nrow(x$coef.list[[1]])]))
+grp.labels <- c("IMDC", "hepatitis", "pneumonitis", "other irAE")
+
+
+FDR_list <- zico_list
+p_list <- zico_list
+R2_list <- zico_list
+  
+for (i in 1:length(zico_list)) {
+  zico.obj <- zico_list[[i]]
+  FDR_list[[i]]  <- zico.obj$p.adj.fdr
+  p_list[[i]]  <- zico.obj$p.raw
+  r2 <- zico.obj$R2[,'Func1']
+  co <- zico.obj$coef.list[[1]][grep(grp.names[i],rownames(zico.obj$coef.list[[1]])),]
+  R2_list[[i]] <-  r2 * sign(co)
+}
+
+#get taxa in both  
+unique_taxa <- names(which(table(unlist(lapply(FDR_list, names))) == length(grp.labels)))
+
+p_list <- lapply(p_list, function(x) x[unique_taxa])
+q_list <- lapply(FDR_list, function(x) x[unique_taxa])
+R2_list <- lapply(R2_list, function(x) x[unique_taxa])
+
+#cbind these results
+df.p <- do.call(cbind, p_list)
+df.q <- do.call(cbind, q_list)
+df.r2 <- do.call(cbind, R2_list)
+
+cutoff <- 0.01; q.cut1 = 0.001; q.cut2=0.005;q.cut3=0.01
+fdr_cutoffs <- c(0.2)
+fdr.cut1 <- min(fdr_cutoffs)
+
+#P_sig is simply one where a row contains a number 1 below cutoff
+P.sig <- df.p[rowSums(df.p <= cutoff) >= 1,]
+R2.sig <- df.r2[rowSums(df.p <= cutoff) >= 1,]
+
+effect_size_cutoff <- 1
+#add the effect size cutoff, e.g. only top 50% effect sizes, not used
+if (effect_size_cutoff < 1) {
+  R2_temp <- t(R2.sig)
+  P_temp <- t(P.sig)
+  effect_cutoff <- min(sort(apply(abs(R2_temp), 1, max), decreasing=T)[1:nrow(R2_temp)*effect_size_cutoff])
+  effect_idx <- apply(abs(R2_temp), 1, function(x) sum(x > effect_cutoff) > 0)
+  P.sig <- as.matrix(t(P_temp)[effect_idx,, drop =F])
+  R2.sig <- as.matrix(t(R2_temp)[effect_idx,, drop =F])
+}
+
+unique.sig <- rownames(P.sig)
+
+dim(P.sig); dim(R2.sig)
+
+rownames(P.sig) <- gsub('.*;g__|s__','',rownames(P.sig))
+rownames(R2.sig) <- gsub('.*;g__|s__','',rownames(R2.sig))
+rownames(df.q) <- gsub('.*;g__|s__','',rownames(df.q))
+
+
+
+#The result of this operation will be a new matrix or data frame where each element 
+#has been replaced based on the condition specified: values less than 0.01 are replaced 
+#with 'A', and all other values are replaced with 'B'.
+tmp <- P.sig
+tmp[] <- apply(tmp, 2, function(x) ifelse(x<=0.01,'A','B'))
+tmp <- as.data.frame(tmp) %>% arrange(across(everything()))
+
+P.sig <- t(P.sig[rownames(tmp),])
+R2.sig <- t(R2.sig[rownames(tmp), ])
+
+level <- 'Family'
+
+otu.name$Species <- gsub(" ", "_", otu.name$Species)
+
+label <- otu.name[otu.name$Genus %in% unique.sig,] %>% dplyr::select(c(level, 'Genus')) 
+label$Genus <- gsub('o__|f__|c__|p__|s__|g__','',label$Genus)
+rownames(tmp) <- gsub('o__|f__|c__|p__|s__|g__','',rownames(tmp))
+
+label <- label[match(rownames(tmp), label$Genus),]
+label[,level] <- gsub('o__|f__|c__|p__|g__','',label[,level])
+
+#subset colors
+colors_sub <- colors[names(colors) %in% label$Family]
+col <- colors_sub[label$Family]
+
+
+ha_combined <- HeatmapAnnotation(
+  ` ` = label[, level],
+  annotation_height = unit(1, "cm"),
+  border = TRUE,
+  col = list(` ` = col),
+  show_legend = F
+)
+
+rownames(R2.sig) <- grp.labels
+colnames(R2.sig) <- gsub("_", " ", colnames(R2.sig))
+rownames(df.q) <- gsub("_", " ", rownames(df.q))
+
+Q.sig <- t(df.q[colnames(R2.sig),])
+colnames(R2.sig) <- gsub("g  ", "", colnames(R2.sig))
+
+
+lgd_sig_p = Legend(pch = c("***", "**","*"), type = "points", labels = c("<0.001", "<0.005", "<0.01"), background="white", title = "p")
+lgd_sig_fdr = Legend(labels="<0.2", title = "q", type="points", pch=0, background="white", size=unit(5, "mm"))
+
+
+
+#make the scale even bidirectional
+scale_max <- max(c(abs(min(R2.sig)), max(R2.sig)))
+
+heatmap_full <- Heatmap(R2.sig, name = "R2", 
+        heatmap_legend_param = list(direction = "vertical"),
+        col = colorRamp2(c(-scale_max, 0, scale_max), 
+                           c("#2171B5",'white', "#FEB24C")),
+        column_gap = unit(1, "mm"), 
+        top_annotation = ha_combined,
+        column_split = (label[,level]),
+        column_title_rot = 30,
+        column_names_max_height = unit(10, "cm"),
+        border = TRUE,
+        column_names_rot = 40,
+        
+        cell_fun = function(j, i, x, y, w, h, fill) {
+          if(P.sig[i,j] <= q.cut1) {
+            grid.text("***", x = x, y = y, hjust = 0.5, vjust = 0.7, gp = gpar(fontsize=12))
+          }else if (P.sig[i,j] <= q.cut2) {
+            grid.text("**", x = x, y = y, hjust = 0.5, vjust = 0.7, gp = gpar(fontsize=12))
+          }else if (P.sig[i,j] <= q.cut3) {
+            grid.text("*", x = x, y = y, hjust = 0.5, vjust = 0.7, gp = gpar(fontsize=12))
+          }
+      # Condition to draw an extra box around specific cells, fdr, only need one
+          if (Q.sig[i, j] <= fdr.cut1) {
+            grid.rect(x = x, y = y, width = w * 0.95, height = h * 0.95,
+              gp = gpar(col = "black", fill = NA, lwd = 1.25))  
+          }
+        },         
+        rect_gp = gpar(col= "white"),
+        show_column_names = T, show_row_names = T,
+        show_column_dend = F,
+        show_row_dend = F,
+        cluster_rows = T,
+        cluster_columns = FALSE,
+        column_names_gp = gpar(fontface = 'italic'),
+        row_names_max_width = max_text_width(rownames(R2.sig), gp = gpar(fontsize = 18))
+) 
+heatmap_full
+
+packed_legends <- packLegend(lgd_sig_p, lgd_sig_fdr, direction = "vertical")
+#packed_legends <- packLegend(lgd_sig_p, direction = "vertical")
+
+heatmap_plot2 <- draw(heatmap_full, padding = unit(c(0.1, 4, 0.1, 0.1), "cm"), annotation_legend_list = list(packed_legends), merge_legend=T) 
+heatmap_plot2
+
+
+png(paste0('../figures/heatmap genus_irAE_with_top_bar.png'), width =9.25*300, height = 3.9*300, res=300)
+
+heatmap_plot2
+
+dev.off()
+
+
+```
+
+Family level
+
+```{r, echo=FALSE, message=FALSE}
+
+
+zico_list <- list(ZicoSeq.obj.IMDC_f, ZicoSeq.obj.hepatitis_f, ZicoSeq.obj.pneumonitis_f, ZicoSeq.obj.otherirAE_f)
+grp.names <- unlist(lapply(zico_list, function(x) rownames(x$coef.list[[1]])[nrow(x$coef.list[[1]])]))
+grp.labels <- c("IMDC", "hepatitis", "pneumonitis", "other irAE")
+
+FDR_list <- zico_list
+p_list <- zico_list
+R2_list <- zico_list
+  
+for (i in 1:length(zico_list)) {
+  zico.obj <- zico_list[[i]]
+  FDR_list[[i]]  <- zico.obj$p.adj.fdr
+  p_list[[i]]  <- zico.obj$p.raw
+  r2 <- zico.obj$R2[,'Func1']
+  co <- zico.obj$coef.list[[1]][grep(grp.names[i],rownames(zico.obj$coef.list[[1]])),]
+  R2_list[[i]] <-  r2 * sign(co)
+}
+
+#get taxa in both  
+unique_taxa <- names(which(table(unlist(lapply(FDR_list, names))) == length(grp.labels)))
+
+p_list <- lapply(p_list, function(x) x[unique_taxa])
+q_list <- lapply(FDR_list, function(x) x[unique_taxa])
+R2_list <- lapply(R2_list, function(x) x[unique_taxa])
+
+#cbind these results
+df.p <- do.call(cbind, p_list)
+df.q <- do.call(cbind, q_list)
+df.r2 <- do.call(cbind, R2_list)
+
+cutoff <- 0.01; q.cut1 = 0.001; q.cut2=0.005;q.cut3=0.01
+fdr_cutoffs <- c(0.2)
+fdr.cut1 <- min(fdr_cutoffs)
+
+#P_sig is simply one where a row contains a number 1 below cutoff
+P.sig <- df.p[rowSums(df.p <= cutoff) >= 1,]
+R2.sig <- df.r2[rowSums(df.p <= cutoff) >= 1,]
+
+unique.sig <- rownames(P.sig)
+
+dim(P.sig); dim(R2.sig)
+
+rownames(P.sig) <- gsub('.*;o__|f__|c__|p__|s__|g__','',rownames(P.sig))
+rownames(R2.sig) <- gsub('.*;o__|f__|c__|p__|s__|g__','',rownames(R2.sig))
+rownames(df.q) <- gsub('.*;o__|f__|c__|p__|s__|g__','',rownames(df.q))
+
+tmp <- P.sig
+tmp[] <- apply(tmp, 2, function(x) ifelse(x<=0.01,'A','B'))
+tmp <- as.data.frame(tmp) %>% arrange(across(everything()))
+
+P.sig <- t(P.sig[rownames(tmp),])
+R2.sig <- t(R2.sig[rownames(tmp), ])
+
+rownames(R2.sig) <- grp.labels
+colnames(R2.sig) <- gsub("_", " ", colnames(R2.sig))
+rownames(df.q) <- gsub("_", " ", rownames(df.q))
+
+Q.sig <- t(df.q[colnames(R2.sig),])
+colnames(R2.sig) <- gsub("g  ", "", colnames(R2.sig))
+
+lgd_sig_p = Legend(pch = c("***", "**","*"), type = "points", labels = c("<0.001", "<0.005", "<0.01"), background="white", title = "nominal p")
+lgd_sig_fdr = Legend(labels="<0.2", title = "fdr", type="points", pch=0, background="white", size=unit(5, "mm"))
+
+
+#make the scale even bidirectional
+scale_max <- max(c(abs(min(R2.sig)), max(R2.sig)))
+
+heatmap_full <- Heatmap(R2.sig, name = "R2", 
+        heatmap_legend_param = list(direction = "vertical"),
+        col = colorRamp2(c(-scale_max, 0, scale_max), 
+                           c("#2171B5",'white', "#FEB24C")),
+        column_gap = unit(1, "mm"), 
+        #top_annotation = ha_combined,
+        #column_split = (label[,level]),
+        column_title_rot = 30,
+        column_names_max_height = unit(10, "cm"),
+        border = TRUE,
+        column_names_rot = 40,
+        
+        cell_fun = function(j, i, x, y, w, h, fill) {
+          if(P.sig[i,j] <= q.cut1) {
+            grid.text("***", x = x, y = y, hjust = 0.5, vjust = 0.7, gp = gpar(fontsize=12))
+          }else if (P.sig[i,j] <= q.cut2) {
+            grid.text("**", x = x, y = y, hjust = 0.5, vjust = 0.7, gp = gpar(fontsize=12))
+          }else if (P.sig[i,j] <= q.cut3) {
+            grid.text("*", x = x, y = y, hjust = 0.5, vjust = 0.7, gp = gpar(fontsize=12))
+          }
+      # Condition to draw an extra box around specific cells, fdr, only need one
+          if (Q.sig[i, j] <= fdr.cut1) {
+            grid.rect(x = x, y = y, width = w * 0.95, height = h * 0.95,
+              gp = gpar(col = "black", fill = NA, lwd = 1.25))  
+          }
+        },         
+        rect_gp = gpar(col= "white"),
+        show_column_names = T, show_row_names = T,
+        show_column_dend = F,
+        show_row_dend = F,
+        cluster_rows = T,
+        cluster_columns = FALSE,
+        column_names_gp = gpar(fontface = 'italic'),
+        row_names_max_width = max_text_width(rownames(R2.sig), gp = gpar(fontsize = 18))
+) 
+#heatmap_full
+
+packed_legends <- packLegend(lgd_sig_p, lgd_sig_fdr, direction = "vertical")
+#packed_legends <- packLegend(lgd_sig_p, direction = "vertical")
+
+heatmap_plot2 <- draw(heatmap_full, padding = unit(c(0.1, 4, 0.1, 0.1), "cm"), annotation_legend_list = list(packed_legends), merge_legend=T) 
+heatmap_plot2
+
+
+png(paste0('../figures/heatmap family_irAE.png'), width =5.5*300, height = 2.8*300, res=300)
+
+heatmap_plot2
+
+dev.off()
+
+
+```
+
+
+Order level
+
+```{r, echo=FALSE, message=FALSE}
+
+
+zico_list <- list(ZicoSeq.obj.IMDC_o, ZicoSeq.obj.hepatitis_o, ZicoSeq.obj.pneumonitis_o, ZicoSeq.obj.otherirAE_o)
+grp.names <- unlist(lapply(zico_list, function(x) rownames(x$coef.list[[1]])[nrow(x$coef.list[[1]])]))
+grp.labels <- c("IMDC", "hepatitis", "pneumonitis", "other irAE")
+
+FDR_list <- zico_list
+p_list <- zico_list
+R2_list <- zico_list
+  
+for (i in 1:length(zico_list)) {
+  zico.obj <- zico_list[[i]]
+  FDR_list[[i]]  <- zico.obj$p.adj.fdr
+  p_list[[i]]  <- zico.obj$p.raw
+  r2 <- zico.obj$R2[,'Func1']
+  co <- zico.obj$coef.list[[1]][grep(grp.names[i],rownames(zico.obj$coef.list[[1]])),]
+  R2_list[[i]] <-  r2 * sign(co)
+}
+
+#get taxa in both  
+unique_taxa <- names(which(table(unlist(lapply(FDR_list, names))) == length(grp.labels)))
+
+p_list <- lapply(p_list, function(x) x[unique_taxa])
+q_list <- lapply(FDR_list, function(x) x[unique_taxa])
+R2_list <- lapply(R2_list, function(x) x[unique_taxa])
+
+#cbind these results
+df.p <- do.call(cbind, p_list)
+df.q <- do.call(cbind, q_list)
+df.r2 <- do.call(cbind, R2_list)
+
+cutoff <- 0.01; q.cut1 = 0.001; q.cut2=0.005;q.cut3=0.01
+fdr_cutoffs <- c(0.2)
+fdr.cut1 <- min(fdr_cutoffs)
+
+#P_sig is simply one where a row contains a number 1 below cutoff
+P.sig <- df.p[rowSums(df.p <= cutoff) >= 1,]
+R2.sig <- df.r2[rowSums(df.p <= cutoff) >= 1,]
+
+unique.sig <- rownames(P.sig)
+
+dim(P.sig); dim(R2.sig)
+
+rownames(P.sig) <- gsub('(o__|f__|c__|p__|s__|g__)', '', rownames(P.sig))
+rownames(R2.sig) <- gsub('(o__|f__|c__|p__|s__|g__)', '',rownames(R2.sig))
+rownames(df.q) <- gsub('(o__|f__|c__|p__|s__|g__)', '',rownames(df.q))
+
+tmp <- P.sig
+tmp[] <- apply(tmp, 2, function(x) ifelse(x<=0.01,'A','B'))
+tmp <- as.data.frame(tmp) %>% arrange(across(everything()))
+
+P.sig <- t(P.sig[rownames(tmp),])
+R2.sig <- t(R2.sig[rownames(tmp), ])
+
+rownames(R2.sig) <- grp.labels
+colnames(R2.sig) <- gsub("_", " ", colnames(R2.sig))
+rownames(df.q) <- gsub("_", " ", rownames(df.q))
+
+Q.sig <- t(df.q[colnames(R2.sig),])
+colnames(R2.sig) <- gsub("g  ", "", colnames(R2.sig))
+
+lgd_sig_p = Legend(pch = c("***", "**","*"), type = "points", labels = c("<0.001", "<0.005", "<0.01"), background="white", title = "nominal p")
+lgd_sig_fdr = Legend(labels="<0.2", title = "fdr", type="points", pch=0, background="white", size=unit(5, "mm"))
+
+
+#make the scale even bidirectional
+scale_max <- max(c(abs(min(R2.sig)), max(R2.sig)))
+
+heatmap_full <- Heatmap(R2.sig, name = "R2", 
+        heatmap_legend_param = list(direction = "vertical"),
+        col = colorRamp2(c(-scale_max, 0, scale_max), 
+                           c("#2171B5",'white', "#FEB24C")),
+        column_gap = unit(1, "mm"), 
+        #top_annotation = ha_combined,
+        #column_split = (label[,level]),
+        column_title_rot = 30,
+        column_names_max_height = unit(10, "cm"),
+        border = TRUE,
+        column_names_rot = 40,
+        
+        cell_fun = function(j, i, x, y, w, h, fill) {
+          if(P.sig[i,j] <= q.cut1) {
+            grid.text("***", x = x, y = y, hjust = 0.5, vjust = 0.7, gp = gpar(fontsize=12))
+          }else if (P.sig[i,j] <= q.cut2) {
+            grid.text("**", x = x, y = y, hjust = 0.5, vjust = 0.7, gp = gpar(fontsize=12))
+          }else if (P.sig[i,j] <= q.cut3) {
+            grid.text("*", x = x, y = y, hjust = 0.5, vjust = 0.7, gp = gpar(fontsize=12))
+          }
+      # Condition to draw an extra box around specific cells, fdr, only need one
+          if (Q.sig[i, j] <= fdr.cut1) {
+            grid.rect(x = x, y = y, width = w * 0.95, height = h * 0.95,
+              gp = gpar(col = "black", fill = NA, lwd = 1.25))  
+          }
+        },         
+        rect_gp = gpar(col= "white"),
+        show_column_names = T, show_row_names = T,
+        show_column_dend = F,
+        show_row_dend = F,
+        cluster_rows = T,
+        cluster_columns = FALSE,
+        column_names_gp = gpar(fontface = 'italic'),
+        row_names_max_width = max_text_width(rownames(R2.sig), gp = gpar(fontsize = 18))
+) 
+#heatmap_full
+
+packed_legends <- packLegend(lgd_sig_p, lgd_sig_fdr, direction = "vertical")
+#packed_legends <- packLegend(lgd_sig_p, direction = "vertical")
+
+heatmap_plot2 <- draw(heatmap_full, padding = unit(c(0.1, 4, 0.1, 0.1), "cm"), annotation_legend_list = list(packed_legends), merge_legend=T) 
+heatmap_plot2
+
+
+png(paste0('../figures/heatmap order_irAE.png'), width =4.65*300, height = 2.8*300, res=300)
+
+heatmap_plot2
+
+dev.off()
+
+
+```
+
+
+Phylum level
+
+```{r, echo=FALSE, message=FALSE}
+
+
+zico_list <- list(ZicoSeq.obj.IMDC_p, ZicoSeq.obj.hepatitis_p, ZicoSeq.obj.pneumonitis_p, ZicoSeq.obj.otherirAE_p)
+grp.names <- unlist(lapply(zico_list, function(x) rownames(x$coef.list[[1]])[nrow(x$coef.list[[1]])]))
+grp.labels <- c("IMDC", "hepatitis", "pneumonitis", "other irAE")
+
+FDR_list <- zico_list
+p_list <- zico_list
+R2_list <- zico_list
+  
+for (i in 1:length(zico_list)) {
+  zico.obj <- zico_list[[i]]
+  FDR_list[[i]]  <- zico.obj$p.adj.fdr
+  p_list[[i]]  <- zico.obj$p.raw
+  r2 <- zico.obj$R2[,'Func1']
+  co <- zico.obj$coef.list[[1]][grep(grp.names[i],rownames(zico.obj$coef.list[[1]])),]
+  R2_list[[i]] <-  r2 * sign(co)
+}
+
+#get taxa in both  
+unique_taxa <- names(which(table(unlist(lapply(FDR_list, names))) == length(grp.labels)))
+
+p_list <- lapply(p_list, function(x) x[unique_taxa])
+q_list <- lapply(FDR_list, function(x) x[unique_taxa])
+R2_list <- lapply(R2_list, function(x) x[unique_taxa])
+
+#cbind these results
+df.p <- do.call(cbind, p_list)
+df.q <- do.call(cbind, q_list)
+df.r2 <- do.call(cbind, R2_list)
+
+cutoff <- 0.01; q.cut1 = 0.001; q.cut2=0.005;q.cut3=0.01
+fdr_cutoffs <- c(0.2)
+fdr.cut1 <- min(fdr_cutoffs)
+
+#P_sig is simply one where a row contains a number 1 below cutoff
+P.sig <- df.p[rowSums(df.p <= cutoff) >= 1,]
+R2.sig <- df.r2[rowSums(df.p <= cutoff) >= 1,]
+
+unique.sig <- rownames(P.sig)
+
+dim(P.sig); dim(R2.sig)
+
+rownames(P.sig) <- gsub('.*;o__|f__|c__|p__|s__|g__','',rownames(P.sig))
+rownames(R2.sig) <- gsub('.*;o__|f__|c__|p__|s__|g__','',rownames(R2.sig))
+rownames(df.q) <- gsub('.*;o__|f__|c__|p__|s__|g__','',rownames(df.q))
+
+tmp <- P.sig
+tmp[] <- apply(tmp, 2, function(x) ifelse(x<=0.01,'A','B'))
+tmp <- as.data.frame(tmp) %>% arrange(across(everything()))
+
+P.sig <- t(P.sig[rownames(tmp),])
+R2.sig <- t(R2.sig[rownames(tmp), ])
+
+rownames(R2.sig) <- grp.labels
+colnames(R2.sig) <- gsub("_", " ", colnames(R2.sig))
+rownames(df.q) <- gsub("_", " ", rownames(df.q))
+
+Q.sig <- t(df.q[colnames(R2.sig),])
+colnames(R2.sig) <- gsub("g  ", "", colnames(R2.sig))
+
+lgd_sig_p = Legend(pch = c("***", "**","*"), type = "points", labels = c("<0.001", "<0.005", "<0.01"), background="white", title = "nominal p")
+lgd_sig_fdr = Legend(labels="<0.2", title = "fdr", type="points", pch=0, background="white", size=unit(5, "mm"))
+
+
+#make the scale even bidirectional
+scale_max <- max(c(abs(min(R2.sig)), max(R2.sig)))
+
+heatmap_full <- Heatmap(R2.sig, name = "R2", 
+        heatmap_legend_param = list(direction = "vertical"),
+        col = colorRamp2(c(-scale_max, 0, scale_max), 
+                           c("#2171B5",'white', "#FEB24C")),
+        column_gap = unit(1, "mm"), 
+        #top_annotation = ha_combined,
+        #column_split = (label[,level]),
+        column_title_rot = 30,
+        column_names_max_height = unit(10, "cm"),
+        border = TRUE,
+        column_names_rot = 40,
+        
+        cell_fun = function(j, i, x, y, w, h, fill) {
+          if(P.sig[i,j] <= q.cut1) {
+            grid.text("***", x = x, y = y, hjust = 0.5, vjust = 0.7, gp = gpar(fontsize=12))
+          }else if (P.sig[i,j] <= q.cut2) {
+            grid.text("**", x = x, y = y, hjust = 0.5, vjust = 0.7, gp = gpar(fontsize=12))
+          }else if (P.sig[i,j] <= q.cut3) {
+            grid.text("*", x = x, y = y, hjust = 0.5, vjust = 0.7, gp = gpar(fontsize=12))
+          }
+      # Condition to draw an extra box around specific cells, fdr, only need one
+          if (Q.sig[i, j] <= fdr.cut1) {
+            grid.rect(x = x, y = y, width = w * 0.95, height = h * 0.95,
+              gp = gpar(col = "black", fill = NA, lwd = 1.25))  
+          }
+        },         
+        rect_gp = gpar(col= "white"),
+        show_column_names = T, show_row_names = T,
+        show_column_dend = F,
+        show_row_dend = F,
+        cluster_rows = T,
+        cluster_columns = FALSE,
+        column_names_gp = gpar(fontface = 'italic'),
+        row_names_max_width = max_text_width(rownames(R2.sig), gp = gpar(fontsize = 18))
+) 
+#heatmap_full
+
+packed_legends <- packLegend(lgd_sig_p, lgd_sig_fdr, direction = "vertical")
+#packed_legends <- packLegend(lgd_sig_p, direction = "vertical")
+
+heatmap_plot2 <- draw(heatmap_full, padding = unit(c(0.1, 4, 0.1, 0.1), "cm"), annotation_legend_list = list(packed_legends), merge_legend=T) 
+heatmap_plot2
+
+
+png(paste0('../figures/heatmap phylum_irAE.png'), width =4.4*300, height = 2.8*300, res=300)
+
+heatmap_plot2
+
+dev.off()
+
+
+```

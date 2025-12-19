@@ -1,0 +1,771 @@
+---
+title: "ICI_analysis_Olink"
+author: "Ruben Mars"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+
+output: 
+  html_document:
+    toc: true
+    theme: cerulean
+    
+---
+
+<style type="text/css">
+.main-container {
+  max-width: 1200px;
+  margin-left: auto;
+  margin-right: auto;
+}
+</style>
+
+***  
+
+## Content
+
+Olink inflammation data
+
+
+***  
+
+
+```{r, echo=FALSE, results='hide',message=FALSE}
+
+require(tidyverse)
+require(readxl)
+require(ggplot2)
+require(RColorBrewer)
+require(vegan)
+require(ape)
+require(tidyverse)
+require(ggpubr)
+require(cowplot)
+require(randomForest)
+require(ROCR)
+require(gtsummary)
+require(flextable)
+require(gridExtra)
+library(ggpubr)
+require(reshape2)
+require(dplyr)
+require(openxlsx)
+require(knitr)
+#library(devtools)
+#install_github("jokergoo/ComplexHeatmap")
+require(ComplexHeatmap)
+require(circlize)
+require(mlbench)
+require(caret)
+require(ropls)
+require(GUniFrac)
+require(GenericML)
+library(dplyr)
+library(tibble)
+library(ggrepel)
+
+
+source("helper functions/MannWhitney_function.R")
+source("helper functions/make_boxplot_figure.R")
+source("helper functions/replace_outliers_with_median.R")
+source("helper functions/zicoseq_volcano_plot.R")
+source("helper functions/zicoseq_heatmap_old_colors.R")
+
+
+```
+
+Read data
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+
+filename <- "../data/Supplementary Table 1.xlsx"
+getSheetNames(filename)
+olink_data_comb_sub <- as.data.frame(read.xlsx(filename, sheet="olink_inflammation", rowNames = T))
+
+
+```
+
+
+Load clinical data
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+
+rmarkdown::render("1_ICI_cohort_description.Rmd")
+
+
+```
+
+
+Sort clinical data and Olink data. Map Olink results with the clinical data
+
+```{r, echo=FALSE, results='hide',message=FALSE}
+
+
+clin_meta_olink <- clin_meta[colnames(olink_data_comb_sub),]
+dim(clin_meta_olink)
+
+dim(clin_meta_olink); dim(olink_data_comb_sub)
+
+
+```
+
+Inspect olink clin data 
+
+```{r, echo=FALSE, results='hide',message=FALSE}
+
+table(clin_meta_olink$IMDC)
+#0   1 
+#131  14 
+
+table(clin_meta_olink$hepatitis)
+#0   1 
+#133  12
+
+table(clin_meta_olink$pneumonitis)
+# 0   1 
+#139   6 
+
+table(clin_meta_olink$IMDC, clin_meta_olink$Olink_plate) #not ideal balance
+table(clin_meta_olink$hepatitis, clin_meta_olink$Olink_plate)
+table(clin_meta_olink$any_toxicity, clin_meta_olink$Olink_plate)
+
+
+```
+
+Looking at time of sampling since treatment start
+
+```{r, echo=FALSE, results='hide',message=FALSE}
+
+hist(clin_meta_olink$days_plasma_med_start)
+hist(clin_meta_olink$days_plasma_irAE_onset)
+
+test_df_stool <- cbind(clin_meta_olink$SubjectID, clin_meta_olink$days_stool_med_start, clin_meta_olink$days_stool_irAE_onset, clin_meta_olink$IMDC)
+test_df_stool[test_df_stool[,4] == 1,]
+
+
+test_df_plasma <- cbind(clin_meta_olink$SubjectID, clin_meta_olink$days_plasma_med_start, clin_meta_olink$days_plasma_irAE_onset, clin_meta_olink$IMDC)
+test_df_plasma[test_df_plasma[,4] == 1,]
+
+#add a column with true pre-treatment and check if they have the same cytokine profile
+clin_meta_olink$true_pretreatment <- clin_meta_olink$days_plasma_med_start <= 0
+
+table(clin_meta_olink$true_pretreatment, clin_meta_olink$IMDC)
+#        0  1
+#  FALSE 57  8
+#  TRUE  74  6
+
+table(clin_meta_olink$true_pretreatment, clin_meta_olink$hepatitis)
+#        0  1
+#  FALSE 60  5
+#  TRUE  73  7
+
+table(clin_meta_olink$true_pretreatment, clin_meta_olink$pneumonitis)
+#        0  1
+#  FALSE 62  3
+#  TRUE  77  3
+
+
+```
+
+
+Beta diversity analysis
+
+```{r, echo=FALSE, results='hide',message=FALSE}
+
+#inspect adjusting for plate
+clin_meta_olink$Olink_plate <- as.factor(clin_meta_olink$Olink_plate)
+
+beta_div <- as.matrix(vegdist(t(olink_data_comb_sub), method = "manhattan"))
+
+set.seed(1)
+# Permanova - Distance based multivariate analysis of variance
+uni_1a <- GUniFrac::adonis3(beta_div ~ Olink_plate + IMDC, data = clin_meta_olink, permutations = 999)$aov.tab
+uni_1b <- GUniFrac::adonis3(beta_div ~ Olink_plate + hepatitis, data = clin_meta_olink, permutations = 999)$aov.tab
+uni_1c <- GUniFrac::adonis3(beta_div ~ Olink_plate + pneumonitis, data = clin_meta_olink, permutations = 999)$aov.tab
+uni_3 <- GUniFrac::adonis3(beta_div ~ Olink_plate + other_irAE, data = clin_meta_olink, permutations = 999)$aov.tab
+uni_6 <- GUniFrac::adonis3(beta_div ~ Olink_plate + Sex, data = clin_meta_olink, permutations = 999)$aov.tab
+uni_7 <- GUniFrac::adonis3(beta_div ~ Olink_plate + Elixhauser_elix.sum, data = clin_meta_olink, permutations = 999)$aov.tab
+uni_8 <- GUniFrac::adonis3(beta_div ~ Olink_plate + Age, data = clin_meta_olink, permutations = 999)$aov.tab
+uni_9 <- GUniFrac::adonis3(beta_div ~ Olink_plate + abx_last_month, data = clin_meta_olink, permutations = 999)$aov.tab
+uni_10 <- GUniFrac::adonis3(beta_div ~ Olink_plate + BMI, data = clin_meta_olink, permutations = 999)$aov.tab
+
+beta_res_list <- list(uni_1a, uni_1b, uni_1c, uni_3, uni_6, uni_7, uni_8, uni_9, uni_10)
+
+R2_vals <- unlist(lapply(beta_res_list, function(x) x[,"R2"][2]))
+p_vals <- unlist(lapply(beta_res_list, function(x) x[,"Pr(>F)"][2]))
+beta_res_df <- as.data.frame(cbind(R2_vals, p_vals))
+
+rownames(beta_res_df) <- as.character(lapply(beta_res_list, function(x) rownames(x)[2]))
+
+beta_res_df <- beta_res_df[order(beta_res_df$R2_vals, decreasing = F),]
+beta_res_df$q_vals <- p.adjust(beta_res_df$p_vals, "fdr")
+
+
+#varying color for p values
+#n of group size
+par(mar=c(4,14,1,1))
+#barplot(beta_res_df$R2_vals, horiz = T, las=1, col = beta_res_df$p_vals < 0.05, names.arg = rownames(beta_res_df))
+barplot(beta_res_df$R2_vals, horiz = T, las=1, col = beta_res_df$q_vals < 0.1, names.arg = rownames(beta_res_df))
+mtext("R2 % variance explained", line=2.5, side=1)
+
+
+filename <- "../figures/barplot Olink manhattan manuscript.png"
+png(filename, width = 8*330, height = 5*330, res = 330)
+par(mar=c(4,14,1,1))
+barplot(beta_res_df$R2_vals, horiz = T, las=1, col = beta_res_df$q_vals < 0.1, names.arg = rownames(beta_res_df))
+mtext("R2 % variance explained", line=2.5, side=1)
+dev.off()
+
+
+write.csv(beta_res_df, file = "../data/beta_res_df manhattan olink cor for plate.csv")
+
+
+```
+
+Adjust for more variables, Age, abx_last_month
+
+```{r, echo=FALSE, results='hide',message=FALSE}
+
+set.seed(1)
+# Permanova - Distance based multivariate analysis of variance
+uni_1a <- GUniFrac::adonis3(beta_div ~ Olink_plate + Age + abx_last_month + IMDC, data = clin_meta_olink, permutations = 999)$aov.tab
+uni_1b <- GUniFrac::adonis3(beta_div ~ Olink_plate + Age + abx_last_month + hepatitis, data = clin_meta_olink, permutations = 999)$aov.tab
+uni_1c <- GUniFrac::adonis3(beta_div ~ Olink_plate + Age + abx_last_month + pneumonitis, data = clin_meta_olink, permutations = 999)$aov.tab
+uni_1d <- GUniFrac::adonis3(beta_div ~ Olink_plate + Age + abx_last_month + other_irAE, data = clin_meta_olink, permutations = 999)$aov.tab
+
+beta_res_list <- list(uni_1a, uni_1b, uni_1c, uni_1d)
+
+R2_vals <- unlist(lapply(beta_res_list, function(x) x[,"R2"][4]))
+p_vals <- unlist(lapply(beta_res_list, function(x) x[,"Pr(>F)"][4]))
+beta_res_df <- as.data.frame(cbind(R2_vals, p_vals))
+
+rownames(beta_res_df) <- as.character(lapply(beta_res_list, function(x) rownames(x)[4]))
+beta_res_df <- beta_res_df[order(beta_res_df$R2_vals, decreasing = F),]
+
+#varying color for p values
+#n of group size
+par(mar=c(4,14,1,1))
+barplot(beta_res_df$R2_vals, horiz = T, las=1, col = beta_res_df$p_vals < 0.05, names.arg = rownames(beta_res_df))
+mtext("R2 % variance explained", line=2.5, side=1)
+
+
+write.csv(beta_res_df, file = "../data/beta_res_df_adj manhattan olink cor for plate Age abx.csv")
+
+
+```
+
+
+Zicoseq group comparisons on abx_last_month
+
+```{r, echo=FALSE, message=FALSE}
+
+data_df <- as.matrix(olink_data_comb_sub)
+meta <- clin_meta_olink
+
+#not adjusted now
+
+set.seed(42)
+ZicoSeq.obj <- ZicoSeq(meta.dat = meta, feature.dat = data_df, 
+                       grp.name = "abx_last_month", feature.dat.type = "other",
+                       adj.name = c('Age'),
+                       prev.filter = 0.2, mean.abund.filter = 0,  
+                       max.abund.filter = 0.002, min.prop = 0, 
+                       # Winsorization to replace outliers
+                       is.winsor = TRUE, outlier.pct = 0.03, winsor.end = 'top',
+                       # Posterior sampling 
+                       is.post.sample = TRUE, post.sample.no = 25, 
+                       # Use the square-root transformation
+                       link.func = list(function (x) x^0.5), stats.combine.func = max,
+                       # Permutation-based multiple testing correction
+                       perm.no = 999,  strata = NULL, 
+                       # Reference-based multiple stage normalization
+                       ref.pct = 0.5, stage.no = 6, excl.pct = 0.2,
+                       # Family-wise error rate control
+                       is.fwer = TRUE, verbose = TRUE, return.feature.dat = T)
+
+ZicoSeq.obj.olink.abx <- ZicoSeq.obj
+
+grp.name = 'abx_last_month' # used for extract coefficient
+p.cutoff = 0.25 # design our expected significance level
+top.n = 20 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "adj" #or "adj"
+
+output_plot <- zicoseq_volcano_plot(ZicoSeq.obj, grp.name, p.cutoff, top.n, p_value_class)
+output_plot$output_plot
+
+#extracellular newly identified receptor for advanced glycation end-products binding protein [EN-RAGE]
+
+table(clin_meta_olink$abx_last_month)
+# 0   1 
+#134  11 
+
+
+```
+
+
+Zicoseq group comparisons on IMDC
+
+```{r, echo=FALSE, message=FALSE}
+
+data_df <- as.matrix(olink_data_comb_sub)
+meta <- clin_meta_olink
+
+set.seed(42)
+ZicoSeq.obj <- ZicoSeq(meta.dat = meta, feature.dat = data_df, 
+                       grp.name = "IMDC", feature.dat.type = "other",
+                       adj.name = c('Age', 'abx_last_month'),
+                       prev.filter = 0.2, mean.abund.filter = 0,  
+                       max.abund.filter = 0.002, min.prop = 0, 
+                       # Winsorization to replace outliers
+                       is.winsor = TRUE, outlier.pct = 0.03, winsor.end = 'top',
+                       # Posterior sampling 
+                       is.post.sample = TRUE, post.sample.no = 25, 
+                       # Use the square-root transformation
+                       link.func = list(function (x) x^0.5), stats.combine.func = max,
+                       # Permutation-based multiple testing correction
+                       perm.no = 999,  strata = NULL, 
+                       # Reference-based multiple stage normalization
+                       ref.pct = 0.5, stage.no = 6, excl.pct = 0.2,
+                       # Family-wise error rate control
+                       is.fwer = TRUE, verbose = TRUE, return.feature.dat = T)
+
+ZicoSeq.obj.olink.IMDC <- ZicoSeq.obj
+
+grp.name = 'IMDC' # used for extract coefficient
+p.cutoff = 0.2 # design our expected significance level
+top.n = 20 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "adj" #or "adj"
+
+res_df_zico_IMDC <- as.data.frame(do.call(cbind, ZicoSeq.obj[c("R2", "p.raw", "p.adj.fdr", "p.adj.fwer")]))
+sig_metabolites_IMDC <- rownames(res_df_zico_IMDC[which(res_df_zico_IMDC$p.adj.fdr <= p.cutoff),])
+
+#very small differences, 
+res_df_IMDC <- MannWhitney_function(tax_df = data_df, groups = grp.name, meta = clin_meta_olink)
+#res_df_IMDC[sig_metabolites_IMDC,]
+
+output_plot <- zicoseq_volcano_plot(ZicoSeq.obj, grp.name, p.cutoff, top.n, p_value_class)
+output_plot$output_plot
+
+
+head(res_df_zico_IMDC[order(res_df_zico_IMDC$p.raw),], 20)
+
+
+```
+
+
+Zicoseq group comparisons on IMDC with additional adjustment for: 
+Olink_plate, true-pretreatment, drug_regimen_simple_no_chemo. Does not markedly affect the results
+
+```{r, echo=FALSE, message=FALSE}
+
+data_df <- as.matrix(olink_data_comb_sub)
+meta <- clin_meta_olink
+
+set.seed(42)
+ZicoSeq.obj <- ZicoSeq(meta.dat = meta, feature.dat = data_df, 
+                       grp.name = "IMDC", feature.dat.type = "other",
+                       adj.name = c('Age', 'abx_last_month'),
+                       prev.filter = 0.2, mean.abund.filter = 0,  
+                       max.abund.filter = 0.002, min.prop = 0, 
+                       # Winsorization to replace outliers
+                       is.winsor = TRUE, outlier.pct = 0.03, winsor.end = 'top',
+                       # Posterior sampling 
+                       is.post.sample = TRUE, post.sample.no = 25, 
+                       # Use the square-root transformation
+                       link.func = list(function (x) x^0.5), stats.combine.func = max,
+                       # Permutation-based multiple testing correction
+                       perm.no = 999,  strata = NULL, 
+                       # Reference-based multiple stage normalization
+                       ref.pct = 0.5, stage.no = 6, excl.pct = 0.2,
+                       # Family-wise error rate control
+                       is.fwer = TRUE, verbose = TRUE, return.feature.dat = T)
+
+ZicoSeq.obj.olink.IMDC_pre <- ZicoSeq.obj
+
+grp.name = 'IMDC' # used for extract coefficient
+p.cutoff = 0.2 # design our expected significance level
+top.n = 20 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "adj" #or "adj"
+
+output_plot <- zicoseq_volcano_plot(ZicoSeq.obj, grp.name, p.cutoff, top.n, p_value_class)
+output_plot$output_plot
+
+
+```
+
+
+Plot significant metabolites IMDC as individual boxplots; based on zicoseq results
+
+```{r, echo=FALSE, message=FALSE}
+
+#replace outliers for plotting
+data <- replace_outliers_with_median(olink_data_comb_sub, clin_meta_olink$IMDC, verbose=T)
+
+sel_colors_full_names <- RColorBrewer::brewer.pal(8, "Dark2")
+sel_colors_full_names <- c("darkgrey", sel_colors_full_names[2], sel_colors_full_names[3:5])
+
+setwd("../figures/boxplots/")
+for (i in 1:length(sig_metabolites_IMDC)) {
+  data_vec <- as.numeric(data[sig_metabolites_IMDC[i],])
+  
+  plotname <- sig_metabolites_IMDC[i]
+  plotname <- gsub("/", "", plotname)
+  
+  make_boxplot_figure(data_vec, clin_meta_olink$IMDC, plottitle = plotname, ylable = "concentration", 
+                      project = "ICI IMDC olink", left_margin=4, add_significance=TRUE, q_or_p = "p",
+                      q.vals=output_plot$res_df[i,]$pvals, file_type="png", symbol=T)
+}
+
+```
+
+
+Plotting for sensitivity analysis stratified by true pretreatment
+
+```{r, echo=FALSE, message=FALSE}
+
+
+#"IL8"    "CXCL9"  "CD6"    "CCL19"  "IL-12B" "TNF"    "CD5"    "CCL3"   "CXCL10"
+
+#For TNF
+data_vec <- as.numeric(data["TNF",])
+df <- as.data.frame(cbind(values=data_vec, IMDC=clin_meta_olink$IMDC, true_pretreatment=clin_meta_olink$true_pretreatment))
+
+#optimize this plot further if needed
+
+df$IMDC <- as.factor(df$IMDC)
+df$true_pretreatment <- as.factor(df$true_pretreatment)
+df$combined_var <- as.factor(paste(df$IMDC, df$true_pretreatment, sep="_"))
+
+combined_palette <- c(adjustcolor(sel_colors_full_names[1], alpha.f = 0.5),
+                      adjustcolor(sel_colors_full_names[1], alpha.f = 1),
+                      adjustcolor(sel_colors_full_names[2], alpha.f = 0.5),
+                      adjustcolor(sel_colors_full_names[2], alpha.f = 1))
+
+ggboxplot(df, x = "IMDC", y = "values", color = "combined_var", add = "jitter", shape = "true_pretreatment",
+          jitter.width = 0.15, jitter.height = 0, palette = combined_palette)
+
+
+#For IL12B
+data_vec <- as.numeric(data["IL-12B",])
+df <- as.data.frame(cbind(values=data_vec, IMDC=clin_meta_olink$IMDC, true_pretreatment=clin_meta_olink$true_pretreatment))
+df$IMDC <- as.factor(df$IMDC)
+df$true_pretreatment <- as.factor(df$true_pretreatment)
+df$combined_var <- as.factor(paste(df$IMDC, df$true_pretreatment, sep="_"))
+
+
+ggboxplot(df, x = "IMDC", y = "values", color = "combined_var", add = "jitter", shape = "true_pretreatment",
+          jitter.width = 0.15, jitter.height = 0 )
+
+
+#For CXCL9
+data_vec <- as.numeric(data["CXCL9",])
+df <- as.data.frame(cbind(values=data_vec, IMDC=clin_meta_olink$IMDC, true_pretreatment=clin_meta_olink$true_pretreatment))
+df$IMDC <- as.factor(df$IMDC)
+df$true_pretreatment <- as.factor(df$true_pretreatment)
+df$combined_var <- as.factor(paste(df$IMDC, df$true_pretreatment, sep="_"))
+
+
+ggboxplot(df, x = "IMDC", y = "values", color = "combined_var", add = "jitter", shape = "true_pretreatment",
+          jitter.width = 0.15, jitter.height = 0 )
+
+
+
+#For IL8
+data_vec <- as.numeric(data["IL8",])
+df <- as.data.frame(cbind(values=data_vec, IMDC=clin_meta_olink$IMDC, true_pretreatment=clin_meta_olink$true_pretreatment))
+df$IMDC <- as.factor(df$IMDC)
+df$true_pretreatment <- as.factor(df$true_pretreatment)
+df$combined_var <- as.factor(paste(df$IMDC, df$true_pretreatment, sep="_"))
+
+
+ggboxplot(df, x = "IMDC", y = "values", color = "combined_var", add = "jitter", shape = "true_pretreatment",
+          jitter.width = 0.15, jitter.height = 0 )
+
+```
+
+
+Zicoseq group comparisons on hepatitis side effects
+
+```{r, echo=FALSE, message=FALSE}
+
+data_df <- as.matrix(olink_data_comb_sub)
+meta <- clin_meta_olink
+
+#table(clin_meta_olink$hepatitis)
+
+set.seed(42)
+ZicoSeq.obj <- ZicoSeq(meta.dat = meta, feature.dat = data_df, 
+                       grp.name = "hepatitis", feature.dat.type = "other",
+                       adj.name = c('Age', 'abx_last_month'),
+                       prev.filter = 0.2, mean.abund.filter = 0,  
+                       max.abund.filter = 0.002, min.prop = 0, 
+                       # Winsorization to replace outliers
+                       is.winsor = TRUE, outlier.pct = 0.03, winsor.end = 'top',
+                       # Posterior sampling 
+                       is.post.sample = TRUE, post.sample.no = 25, 
+                       # Use the square-root transformation
+                       link.func = list(function (x) x^0.5), stats.combine.func = max,
+                       # Permutation-based multiple testing correction
+                       perm.no = 999,  strata = NULL, 
+                       # Reference-based multiple stage normalization
+                       ref.pct = 0.5, stage.no = 6, excl.pct = 0.2,
+                       # Family-wise error rate control
+                       is.fwer = TRUE, verbose = TRUE, return.feature.dat = T)
+
+
+ZicoSeq.obj.olink.hepatitis <- ZicoSeq.obj
+
+res_df_zico_hepatitis <- as.data.frame(do.call(cbind, ZicoSeq.obj[c("R2", "p.raw", "p.adj.fdr", "p.adj.fwer")]))
+
+sig_metabolites_hepatitis <- rownames(res_df_zico_hepatitis[which(res_df_zico_hepatitis$p.adj.fdr <= 0.25),])
+
+grp.name = 'hepatitis' # used for extract coefficient
+p.cutoff = 0.2 # design our expected significance level
+top.n = 20 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "adj" #or "adj"
+
+output_plot <- zicoseq_volcano_plot(ZicoSeq.obj, grp.name, p.cutoff, top.n, p_value_class)
+output_plot$output_plot
+
+
+```
+
+
+Zicoseq group comparisons on hepatitis side effects adjusting for true pretreatment
+
+```{r, echo=FALSE, message=FALSE}
+
+data_df <- as.matrix(olink_data_comb_sub)
+meta <- clin_meta_olink
+
+#table(clin_meta_olink$hepatitis)
+
+set.seed(42)
+ZicoSeq.obj <- ZicoSeq(meta.dat = meta, feature.dat = data_df, 
+                       grp.name = "hepatitis", feature.dat.type = "other",
+                       adj.name = c('Age', 'abx_last_month'),
+                       prev.filter = 0.2, mean.abund.filter = 0,  
+                       max.abund.filter = 0.002, min.prop = 0, 
+                       # Winsorization to replace outliers
+                       is.winsor = TRUE, outlier.pct = 0.03, winsor.end = 'top',
+                       # Posterior sampling 
+                       is.post.sample = TRUE, post.sample.no = 25, 
+                       # Use the square-root transformation
+                       link.func = list(function (x) x^0.5), stats.combine.func = max,
+                       # Permutation-based multiple testing correction
+                       perm.no = 999,  strata = NULL, 
+                       # Reference-based multiple stage normalization
+                       ref.pct = 0.5, stage.no = 6, excl.pct = 0.2,
+                       # Family-wise error rate control
+                       is.fwer = TRUE, verbose = TRUE, return.feature.dat = T)
+
+
+grp.name = 'hepatitis' # used for extract coefficient
+p.cutoff = 0.2 # design our expected significance level
+top.n = 20 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "adj" #or "adj"
+
+output_plot <- zicoseq_volcano_plot(ZicoSeq.obj, grp.name, p.cutoff, top.n, p_value_class)
+output_plot$output_plot
+
+
+```
+
+
+Plot significant metabolites hepatitis as individual boxplots; based on zicoseq results
+
+```{r, echo=FALSE, message=FALSE}
+
+#replace outliers for plotting
+data <- replace_outliers_with_median(olink_data_comb_sub, clin_meta_olink$hepatitis, verbose=T)
+#data <- olink_data_sub_clin
+
+setwd("../figures/boxplots/")
+for (i in 1:length(sig_metabolites_hepatitis)) {
+  data_vec <- as.numeric(data[sig_metabolites_hepatitis[i],])
+  
+  plotname <- sig_metabolites_hepatitis[i]
+  plotname <- gsub("/", "", plotname)
+  
+  make_boxplot_figure(data_vec, clin_meta_olink$hepatitis, plottitle = plotname, ylable = "concentration", 
+                      project = "ICI hepatitis olink", left_margin=4, add_significance=TRUE, q_or_p = "p",
+                      q.vals=output_plot$res_df[i,]$pvals, file_type="png",  symbol=T)
+}
+
+
+```
+
+
+Zicoseq group comparisons on pneumonitis
+
+```{r, echo=FALSE, message=FALSE}
+
+data_df <- as.matrix(olink_data_comb_sub)
+meta <- clin_meta_olink
+
+#not adjusted now
+
+set.seed(42)
+ZicoSeq.obj <- ZicoSeq(meta.dat = meta, feature.dat = data_df, 
+                       grp.name = "pneumonitis", feature.dat.type = "other",
+                       adj.name = c('Age', 'abx_last_month'),
+                       prev.filter = 0.2, mean.abund.filter = 0,  
+                       max.abund.filter = 0.002, min.prop = 0, 
+                       # Winsorization to replace outliers
+                       is.winsor = TRUE, outlier.pct = 0.03, winsor.end = 'top',
+                       # Posterior sampling 
+                       is.post.sample = TRUE, post.sample.no = 25, 
+                       # Use the square-root transformation
+                       link.func = list(function (x) x^0.5), stats.combine.func = max,
+                       # Permutation-based multiple testing correction
+                       perm.no = 999,  strata = NULL, 
+                       # Reference-based multiple stage normalization
+                       ref.pct = 0.5, stage.no = 6, excl.pct = 0.2,
+                       # Family-wise error rate control
+                       is.fwer = TRUE, verbose = TRUE, return.feature.dat = T)
+
+ZicoSeq.obj.olink.pneumonitis <- ZicoSeq.obj
+
+grp.name = 'pneumonitis' # used for extract coefficient
+p.cutoff = 0.2 # design our expected significance level
+top.n = 20 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "adj" #or "adj"
+
+res_df_zico_pneumonitis <- as.data.frame(do.call(cbind, ZicoSeq.obj[c("R2", "p.raw", "p.adj.fdr", "p.adj.fwer")]))
+sig_metabolites_pneumonitis <- rownames(res_df_zico_pneumonitis[which(res_df_zico_pneumonitis$p.adj.fdr <= p.cutoff),])
+
+output_plot <- zicoseq_volcano_plot(ZicoSeq.obj, grp.name, p.cutoff, top.n, p_value_class)
+output_plot$output_plot
+
+
+```
+
+
+Zicoseq group comparisons on other irAE
+
+```{r, echo=FALSE, message=FALSE}
+
+data_df <- as.matrix(olink_data_comb_sub)
+meta <- clin_meta_olink
+
+
+set.seed(42)
+ZicoSeq.obj <- ZicoSeq(meta.dat = meta, feature.dat = data_df, 
+                       grp.name = "other_irAE", feature.dat.type = "other",
+                       adj.name = c('Age', 'abx_last_month'),
+                       prev.filter = 0.2, mean.abund.filter = 0,  
+                       max.abund.filter = 0.002, min.prop = 0, 
+                       # Winsorization to replace outliers
+                       is.winsor = TRUE, outlier.pct = 0.03, winsor.end = 'top',
+                       # Posterior sampling 
+                       is.post.sample = TRUE, post.sample.no = 25, 
+                       # Use the square-root transformation
+                       link.func = list(function (x) x^0.5), stats.combine.func = max,
+                       # Permutation-based multiple testing correction
+                       perm.no = 999,  strata = NULL, 
+                       # Reference-based multiple stage normalization
+                       ref.pct = 0.5, stage.no = 6, excl.pct = 0.2,
+                       # Family-wise error rate control
+                       is.fwer = TRUE, verbose = TRUE, return.feature.dat = T)
+
+
+ZicoSeq.obj.olink.other_irAE <- ZicoSeq.obj
+
+res_df_zico_other_irAE <- as.data.frame(do.call(cbind, ZicoSeq.obj[c("R2", "p.raw", "p.adj.fdr", "p.adj.fwer")]))
+
+sig_metabolites_other_irAE <- rownames(res_df_zico_other_irAE[which(res_df_zico_other_irAE$p.adj.fdr <= 0.25),])
+
+grp.name = 'other_irAE' # used for extract coefficient
+p.cutoff = 0.2 # design our expected significance level
+top.n = 20 # For example we want to show significant p.adj.fdr with top 5 effect size(R2)
+p_value_class <- "adj" #or "adj"
+
+output_plot <- zicoseq_volcano_plot(ZicoSeq.obj, grp.name, p.cutoff, top.n, p_value_class)
+output_plot$output_plot
+
+#plot boxplots
+
+
+```
+
+
+Heatmap of all results
+
+```{r, echo=FALSE, message=FALSE}
+
+#combine all results in a heatmap
+#use the actual name of the coefficient as input group names
+
+zico_list <- list(ZicoSeq.obj.olink.IMDC, ZicoSeq.obj.olink.hepatitis, ZicoSeq.obj.olink.pneumonitis, 
+                  ZicoSeq.obj.olink.other_irAE)
+grp.names <- unlist(lapply(zico_list, function(x) rownames(x$coef.list[[1]])[nrow(x$coef.list[[1]])]))
+grp.labels <- c("IMDC", "hepatitis", "pneumonitis", "other irAE")
+
+sign_cutoffs <- c(0.2, 0.1, 0.05) #for stars in plots
+p_or_q <- "q" #"q"
+
+heatmap_list <- zicoseq_heatmap(zico_list, grp.names, grp.labels, sign_cutoffs = sign_cutoffs, p_or_q=p_or_q, column_name_rot=40)
+heatmap_list$heatmap_plot
+sign_features_olink <- heatmap_list$sign_names
+
+
+filename <- "../figures/olink ICI heatmap manuscript fdr 0_2.png"
+png(filename, width = 4.25*330, height = 3.5*330, res = 330)
+heatmap_list$heatmap_plot
+dev.off()
+
+
+#save version as horizontal
+heatmap_list <- zicoseq_heatmap(zico_list, grp.names, grp.labels, sign_cutoffs = sign_cutoffs, p_or_q=p_or_q, column_name_rot=40, rotate=T, left_margin = 1)
+
+filename <- "../figures/olink ICI heatmap manuscript fdr 0_2 horizontal.png"
+png(filename, width = 6*330, height = 2.4*330, res = 330)
+heatmap_list$heatmap_plot
+dev.off()
+
+
+
+```
+
+
+Correlate LBP with Olink results
+
+```{r, echo=FALSE, message=FALSE}
+
+
+comb_list <- list(olink_data_comb_sub)
+lapply(comb_list, dim)
+
+x <- as.numeric(clin_meta_olink$LBP_conc_ng_ml)
+cor_res_list <- vector(mode = "list", length = length(comb_list))
+for (k in 1:length(comb_list)) {
+  y_data_sub <- comb_list[[k]]
+  cor_list <- vector(mode = "list", length = nrow(y_data_sub))
+  for (i in 1:nrow(y_data_sub)) {
+    y <- as.numeric(y_data_sub[i,])
+    cor_list[[i]][1] <- cor(x, y, use="na.or.complete", method="spearman") #there might be NAs in the data
+    cor_list[[i]][2] <- suppressWarnings(cor.test(x, y, use="na.or.complete", method="spearman")$p.value)
+  }
+  cor_df <- as.data.frame(do.call(rbind, cor_list), stringsAsFactors=F)
+  names(cor_df) <- c("cor", "p.val")
+  rownames(cor_df) <- rownames(y_data_sub)
+  #omit NAs
+  cor_df <- cor_df[!is.na(cor_df$cor),]
+  cor_df$fdr <- p.adjust(cor_df$p.val, "fdr")
+  cor_df <- cor_df[order(abs(cor_df$cor), decreasing = T),]
+  cor_res_list[[k]] <- cor_df
+}
+
+lapply(cor_res_list, dim)
+
+head(cor_res_list[[1]], 20)
+
+
+olink_t <- olink_data_comb_sub
+plot(as.numeric(olink_t["IL6",]), x)
+cor.test(as.numeric(olink_t["IL6",]), x, use="na.or.complete", method="spearman")
+
+
+
+```
+

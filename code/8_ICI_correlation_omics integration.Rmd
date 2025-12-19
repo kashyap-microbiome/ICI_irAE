@@ -1,0 +1,493 @@
+---
+title: "correlation_analysis_irAE"
+author: "Ruben Mars"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+
+output: html_document
+
+    
+---
+
+
+
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+
+library(tidyverse)
+library(caret)
+library(cowplot)
+library(mcmcplots)
+library(openxlsx)
+library(vegan)
+library(scales)
+#devtools::install_github("drjingma/metaMint")
+library(metaMint)
+library(matrixStats)
+#install.packages("SmCCNet")
+library(SmCCNet)
+library(dplyr)
+library(data.table)
+library(igraph)
+library(ggraph)
+#devtools::install_github("cran/SDMTools")
+library(SDMTools)
+require(circlize)
+require(RColorBrewer)  
+library(tidygraph)
+
+
+knitr::opts_chunk$set(echo = FALSE, 
+                      fig.width = 7, #this also affects the size of the labels
+                      fig.asp = 1)
+
+```
+
+
+load the actual data
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+#update data source to supplementary table name
+filename <- "../data/Supplementary Table 1.xlsx"
+sheet_names <- getSheetNames(filename)
+data_list <- lapply(sheet_names, function(x) read.xlsx(filename, sheet=x, rowNames = T))
+names(data_list) <- sheet_names
+lapply(data_list, dim)
+
+
+names(data_list)
+data_list_sub <- data_list[c("phylo_s", "olink_inflammation", "pathabundance_df", "stool_mx")]
+#lapply(data_list_sub, dim)
+
+#select samples in all datasets.
+temp_table <- table(unlist(lapply(data_list_sub, colnames)))
+subject_in_all_datasets <- names(temp_table)[temp_table == 4]
+
+
+```
+
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+data_list_sub_sel <- lapply(data_list_sub, function(x) x[,subject_in_all_datasets])
+
+cutoff <- 0.8 * ncol(data_list_sub_sel$pathabundance_df)
+
+data_list_sub_sel$pathabundance_df <- data_list_sub_sel$pathabundance_df[which(rowSums(data_list_sub_sel$pathabundance_df == 0) < cutoff & rowMeans(data_list_sub_sel$pathabundance_df) > 0.0001),]
+
+dim(data_list_sub_sel$pathabundance_df)
+
+
+#make numeric
+#make all numeric
+for (i in 1:length(data_list_sub_sel)) {
+  temp_list <- data_list_sub_sel
+  temp_list[[1]] <- apply(temp_list[[1]], 2, function(x) as.numeric(as.character(x)))
+  temp_list[[2]] <- apply(temp_list[[2]], 2, function(x) as.numeric(as.character(x)))
+  temp_list[[3]] <- apply(temp_list[[3]], 2, function(x) as.numeric(as.character(x)))
+  temp_list[[4]] <- apply(temp_list[[4]], 2, function(x) as.numeric(as.character(x)))
+  
+  rownames(temp_list[[1]]) <- rownames(data_list_sub_sel[[1]])
+  rownames(temp_list[[2]]) <- rownames(data_list_sub_sel[[2]])
+  rownames(temp_list[[3]]) <- rownames(data_list_sub_sel[[3]])
+  rownames(temp_list[[4]]) <- rownames(data_list_sub_sel[[4]])
+  
+  data_list_sub_sel <- temp_list
+}
+
+lapply(data_list_sub_sel, dim)
+
+
+#subset clin_meta for subject in all datasets
+clin_meta <- data_list$clin_meta[subject_in_all_datasets,]
+dim(clin_meta)
+#[1] 143 51
+
+
+#rarify the phylo_s
+hist(colSums(data_list_sub_sel$phylo_s))
+
+phylo_s <- data_list_sub_sel$phylo_s
+raremax <- min(colSums(phylo_s))
+# Rarefy the data to the minimum number of individuals
+phylo_s_rar <- t(rrarefy(t(phylo_s), raremax))
+dim(phylo_s_rar)
+#8212  143
+
+#filter species abundance by prevalence
+phylo_s_ra <- sweep(phylo_s_rar, MARGIN = 2, colSums(phylo_s_rar), '/')
+cutoff <- 0.8 * ncol(phylo_s_ra)
+phylo_s_sub <- phylo_s_rar[which(rowSums(phylo_s_ra == 0) < cutoff & rowMeans(phylo_s_ra) > 0.0001),]
+dim(phylo_s_sub)
+#660 143
+
+
+#scale columns in same range
+olink_inflammation <- data_list_sub_sel$olink_inflammation 
+pathabundance_df <- data_list_sub_sel$pathabundance_df
+stool_mx <- data_list_sub_sel$stool_mx
+
+phylo_s_sub_scale <- mclr(phylo_s_sub)
+olink_inflammation_scale <- olink_inflammation #no scaling
+pathabundance_df_scale <- mclr(pathabundance_df)
+
+
+#metabolomics prevalence filter
+cutoff <- 0.8 * ncol(stool_mx)
+stool_mx <- stool_mx[rowSums(stool_mx == 0) < cutoff,]
+stool_mx_scale <- log10((stool_mx)*10000)
+stool_mx_scale[stool_mx_scale == "-Inf"] <- 0
+
+#uM/gram was original, 10*pM/gram
+
+
+
+#now all similar scales
+par(mfrow=c(2,2))
+hist(rowSums(phylo_s_sub_scale))
+hist(rowSums(olink_inflammation_scale))
+hist(rowSums(pathabundance_df_scale))
+hist(rowSums(stool_mx_scale))
+
+
+dim(phylo_s_sub_scale); dim(olink_inflammation_scale); dim(pathabundance_df_scale); dim(stool_mx_scale)
+#[1] 660 143
+#[1]  72 143
+#[1] 368 143
+#[1] 312 143
+
+
+```
+
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+#combine all features
+combined_feature_list <- list(phylo_s_sub_scale, olink_inflammation_scale, pathabundance_df_scale, stool_mx_scale)
+combined_feature_list <- lapply(combined_feature_list, t)
+names(combined_feature_list) <- c("mg_species", "plasma_cytokines", "mg_pathways", "mx_stool")
+
+
+sample_metadata <- as.data.frame(cbind(clin_meta$IMDC, colnames(phylo_s_sub_scale)))
+rownames(sample_metadata) <- colnames(phylo_s_sub_scale)
+colnames(sample_metadata) <- c("Y", "subjectID")
+
+
+#filter by variance, remove low variance features
+combined_feature_list_var <- lapply(combined_feature_list, function(x) x[,which(colVars(x) > 0.1)])
+lapply(combined_feature_list_var, dim)
+
+#save(combined_feature_list_var, file="~/Dropbox/Mayo_RS/R/Tutorials/SmCCNet/data.RData")
+
+
+```
+
+
+Perform canonical Spearman correlation networks
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+
+#creates data frame with column pairs, correlation, and p-value
+create_corr_frame <- function(df1, df2){
+  set.seed(42)
+  #calculate number of rows we will need in our final data frame
+  common_rows <- intersect(row.names(df1), row.names(df2))
+  df1 <- df1[common_rows,]
+  df2 <- df2[common_rows,]
+  rows <- ncol(df1)*ncol(df2)
+  #create factor vectors for x and y columns (vertices)
+  x <- factor(levels=unique(colnames(df1)))
+  y <- factor(levels=unique(colnames(df2)))
+  #set levels for x and y ahead of time
+  #create numeric vectors for correlation and p-value columns
+  correlation <- numeric(rows)
+  pval <- numeric(rows)
+  index <- 1
+  for(i in colnames(df1)){
+    for(j in colnames(df2)){
+      a <- as.numeric(df1[,i])
+      b <- as.numeric(df2[,j])
+      cor <- cor.test(a, b, method="spearman")
+      x[index] <- i
+      y[index] <- j
+      correlation[index] <- cor$estimate
+      pval[index] <- cor$p.value
+      index <- index + 1
+    }
+  }
+  dat <- data.frame(x=x, y=y, correlation=correlation, pval=pval)
+  dat
+}
+
+```
+
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+
+set.seed(42)
+spe_cyt <- create_corr_frame(combined_feature_list_var$mg_species, combined_feature_list_var$plasma_cytokines)
+spe_path <- create_corr_frame(combined_feature_list_var$mg_species, combined_feature_list_var$mg_pathways)
+spe_stoolmx <- create_corr_frame(combined_feature_list_var$mg_species, combined_feature_list_var$mx_stool)
+path_cyt <- create_corr_frame(combined_feature_list_var$mg_pathways, combined_feature_list_var$plasma_cytokines)
+path_stoolmx <- create_corr_frame(combined_feature_list_var$mg_pathways, combined_feature_list_var$mx_stool)
+stoolmx_cyt <- create_corr_frame(combined_feature_list_var$mx_stool, combined_feature_list_var$plasma_cytokines)
+
+#add fdr-adjusted p-values column
+spe_cyt$fdr_pval <- p.adjust(spe_cyt$pval, method="fdr")
+spe_path$fdr_pval <- p.adjust(spe_path$pval, method="fdr")
+spe_stoolmx$fdr_pval <- p.adjust(spe_stoolmx$pval, method="fdr")
+path_cyt$fdr_pval <- p.adjust(path_cyt$pval, method="fdr")
+path_stoolmx$fdr_pval <- p.adjust(path_stoolmx$pval, method="fdr")
+stoolmx_cyt$fdr_pval <- p.adjust(stoolmx_cyt$pval, method="fdr")
+
+
+setorderv(spe_cyt, cols="pval", order=1)
+setorderv(spe_path, cols="pval", order=1)
+setorderv(spe_stoolmx, cols="pval", order=1)
+setorderv(path_cyt, cols="pval", order=1)
+setorderv(path_stoolmx, cols="pval", order=1)
+setorderv(stoolmx_cyt, cols="pval", order=1)
+
+
+
+```
+
+
+Exploring another way to do this focused on the metabolites of interest and getting all of their top correlations
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+#inspecting
+#c("Orotic.acid", "Indolelactic.acid", "3-Hydroxybutryic.acid", "2-Hydroxy-2-methylbutyric.acid")
+head(stoolmx_cyt[stoolmx_cyt$x == "Orotic.acid",], 10) #negative correlations TRANCE related to TNF, MCP-2 (=CCL8) IL-12B, SIRT2,  STAMBP
+#CCL8 recruits monocytes to the colon, which can lead to inflammation. https://pmc.ncbi.nlm.nih.gov/articles/PMC4518321/
+head(stoolmx_cyt[stoolmx_cyt$x == "Indolelactic.acid",], 10) #CDCP1, TNF IL-15RA 
+head(stoolmx_cyt[stoolmx_cyt$x == "3-Hydroxybutyric.acid",], 10)  
+#some interesting ones, explore late
+head(stoolmx_cyt[stoolmx_cyt$x == "2-Hydroxy-2-methylbutyric.acid",], 10) #positive correlations
+
+head(spe_stoolmx[spe_stoolmx$y == "Orotic.acid",], 20)
+head(path_stoolmx[path_stoolmx$y == "Orotic.acid",], 10)
+
+head(spe_stoolmx[spe_stoolmx$y == "Orotic.acid" & grep(spe_stoolmx$x, "Clostridium")], 20)
+
+
+```
+
+
+Version for orotic acid only
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+
+sig_metabolites <- c("Orotic.acid")
+
+sig_rows <- which(stoolmx_cyt$x %in% sig_metabolites &
+        stoolmx_cyt$pval < 0.05)
+sig_cytokines <- as.character(stoolmx_cyt$y[sig_rows])
+
+sig_stoolmx_cyt <- stoolmx_cyt[sig_rows,]
+
+sig_spe_stoolmx <- spe_stoolmx[which(spe_stoolmx$y == sig_metabolites & spe_stoolmx$fdr_pval < 0.1),]
+sig_spe_cyt <- spe_cyt[which(spe_cyt$y == sig_cytokines & spe_cyt$pval < 0.01),]
+sig_path_cyt <- path_cyt[which(path_cyt$y == sig_cytokines & path_cyt$pval < 0.01),]
+sig_path_stoolmx <- path_stoolmx[which(path_stoolmx$y == sig_metabolites & path_stoolmx$fdr_pval < 0.1),]
+
+spe_path_sel <- spe_path[intersect(which(spe_path$x %in% unique(c(sig_spe_stoolmx$x, sig_spe_cyt$x))),
+                                 which(spe_path$y %in% unique(c(sig_path_cyt$x, sig_path_stoolmx$x)))),]
+
+sig_spe_path <- spe_path_sel[spe_path_sel$fdr_pval < 0.01,]
+#length(unique(spe_path_sel$y))
+
+
+dim(sig_stoolmx_cyt); dim(sig_spe_stoolmx); dim(sig_spe_cyt); dim(sig_path_cyt); dim(sig_spe_path); dim(sig_path_stoolmx)
+#[1] 5 5
+#[1] 31  5
+#[1] 25  5
+#[1] 1 5
+#[1] 14  5
+#[1] 5 5
+
+length(unique(sig_spe_cyt$x)); length(unique(sig_spe_cyt$y)) #21, 4
+#one pathway with one cytokine, IL-12B, negative
+
+#count the number of unique pathways, species, cytokines
+length(unique(c(sig_spe_stoolmx$x, sig_spe_cyt$x, sig_spe_path$x))) #54
+length(unique(c(sig_path_cyt$x, sig_spe_path$y, sig_path_stoolmx$x))) #6
+
+
+
+```
+
+Plot the orotic acid network
+ 
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+sig_list <- list(sig_spe_cyt, #
+                 sig_spe_path, #
+                 sig_spe_stoolmx, #
+                 sig_path_cyt, #
+                 sig_path_stoolmx, #
+                 sig_stoolmx_cyt) #
+lapply(sig_list, dim)
+
+
+network_table <- do.call(rbind, sig_list)
+dim(network_table)
+
+network_table <- network_table[complete.cases(network_table),]
+colnames(network_table)[1:3] <- c("from", "to", "correlation")
+network_table$direction <- ifelse(network_table$correlation < 0, "neg", "pos")
+network_table$weight <- abs(network_table$correlation)
+
+
+unique_nodes <- as.character(unique(c(unique(network_table$from), unique(network_table$to))))
+node_class <- unique_nodes
+
+node_class[node_class %in% sig_metabolites] <- "metabolite"
+node_class[node_class %in% sig_cytokines] <- "cytokine"
+node_class[grep("s__", node_class)] <- "species"
+node_class[grep("\\-", node_class)] <- "pathways"
+
+nodes <- data.frame(
+  name = unique_nodes,
+  type = node_class)
+
+
+#make color scale pos neg
+
+
+set.seed(42)
+#nodes$show_label <- ifelse(nodes$type %in% c("species", "metabolite", "cytokine"), TRUE, FALSE)
+g <- graph_from_data_frame(d=network_table[,c("from", "to", "correlation")], vertices=nodes, directed=F)
+
+
+#update these colors
+group_colors <- rev(RColorBrewer::brewer.pal(4, "Dark2"))
+group_colors[3] <- "darkgrey"
+group_colors[4] <- "#0072B2"
+
+V(g)$color <- group_colors[as.numeric(as.factor(V(g)$type))]
+#V(g)$show_label <- nodes$show_label #when comment out show all
+
+#filter by node degree? >1
+node_degrees <- igraph::degree(g)
+nodes_to_keep <- names(node_degrees[node_degrees >= 2])
+g_filtered <- induced_subgraph(g, nodes_to_keep)
+
+#network_table_filtered <- 
+network_table_sub <- network_table[network_table$from %in% nodes_to_keep,]
+network_table_sub <- network_table_sub[network_table_sub$to %in% nodes_to_keep,]
+network_table_filtered <- network_table_sub
+
+n = network_table_filtered$weight
+
+
+```
+
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+
+network_table_filtered
+
+
+```
+
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+max_abs <- max(abs(network_table$correlation))
+
+g_filtered <- as_tbl_graph(g_filtered)
+
+
+png("../figures/correlation_network_OA_metabolites.png", width=8*300, height=4.5*300, res=300)
+set.seed(1)
+
+ggraph(g_filtered, layout = "stress") +
+  geom_edge_arc(
+    strength = 0.1,
+    aes(edge_colour = correlation,  # Use edge attribute directly
+        edge_alpha = 0.7,
+        edge_width = n)
+  ) +
+  scale_edge_colour_gradientn(
+    colours = c("#2171B5", "white", "#FEB24C"),
+    limits = c(-max_abs, max_abs)  # Symmetric around zero
+  ) +
+  scale_edge_width(range = c(1, 3)) +
+  geom_node_point(
+    size = 5,
+    color = group_colors[as.numeric(as.factor(V(g_filtered)$type))]
+  ) +
+  geom_node_text(
+    aes(label = name),
+    repel = TRUE,
+    point.padding = unit(0.2, "lines"),
+    cex = 2.4
+  ) +
+  theme_void()
+
+dev.off()
+
+
+
+svg("../figures/correlation_network_OA_metabolites.svg", width=8, height=4.5)
+set.seed(1)
+
+ggraph(g_filtered, layout = "stress") +
+  geom_edge_arc(
+    strength = 0.1,
+    aes(edge_colour = correlation,  # Use edge attribute directly
+        edge_alpha = 0.7,
+        edge_width = n)
+  ) +
+  scale_edge_colour_gradientn(
+    colours = c("#2171B5", "white", "#FEB24C"),
+    limits = c(-max_abs, max_abs)  # Symmetric around zero
+  ) +
+  scale_edge_width(range = c(1, 3)) +
+  geom_node_point(
+    size = 5,
+    color = group_colors[as.numeric(as.factor(V(g_filtered)$type))]
+  ) +
+  geom_node_text(
+    aes(label = name),
+    repel = TRUE,
+    point.padding = unit(0.2, "lines"),
+    cex = 2.4
+  ) +
+  theme_void()
+
+
+dev.off()
+
+
+
+```
+
+
+
+```{r, echo=FALSE, results='hide',message=FALSE, warning=FALSE}
+
+
+#stoolmx_cyt[which(stoolmx_cyt$x == "Indolelactic.acid" & stoolmx_cyt$y == "IL8"),]
+vals_IL8 <- combined_feature_list_var$plasma_cytokines[,"IL8"]
+vals_TNF <- combined_feature_list_var$plasma_cytokines[,"TNF"]
+
+cor.test(vals_IL8, vals_TNF, method="spearman")
+#data:  vals_IL8 and vals_TNF
+#S = 269226, p-value = 2.997e-08
+#alternative hypothesis: true rho is not equal to 0
+#sample estimates:
+#      rho 
+#0.4475648 
+
+
+
+```
+
